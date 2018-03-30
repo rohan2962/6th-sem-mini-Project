@@ -1,0 +1,591 @@
+"""
+Table of Contents Extension for Python-Markdown
+===============================================
+
+See <https://pythonhosted.org/Markdown/extensions/toc.html>
+for documentation.
+
+Oringinal code Copyright 2008 [Jack Miller](http://codezen.org)
+
+All changes Copyright 2008-2014 The Python Markdown Project
+
+License: [BSD](http://www.opensource.org/licenses/bsd-license.php)
+
+"""
+
+from __future__ import absolute_import
+from __future__ import unicode_literals
+from . import Extension
+from ..treeprocessors import Treeprocessor
+from ..util import etree, parseBoolValue, AMP_SUBSTITUTE, HTML_PLACEHOLDER_RE, string_type
+import re
+import unicodedata
+
+
+def slugify(value, separator):
+    """ Slugify a string, to make it URL friendly. """
+    value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore')
+    value = re.sub('[^\w\s-]', '', value.decode('ascii')).strip().lower()
+    return re.sub('[%s\s]+' % separator, separator, value)
+
+
+IDCOUNT_RE = re.compile(r'^(.*)_([0-9]+)$')
+
+
+def unique(id, ids):
+    """ Ensure id is unique in set of ids. Append '_1', '_2'... if not """
+    while id in ids or not id:
+        m = IDCOUNT_RE.match(id)
+        if m:
+            id = '%s_%d' % (m.group(1), int(m.group(2))+1)
+        else:
+            id = '%s_%d' % (id, 1)
+    ids.add(id)
+    return id
+
+
+def stashedHTML2text(text, md):
+    """ Extract raw HTML from stash, reduce to plain text and swap with placeholder. """
+    def _html_sub(m):
+        """ Substitute raw html with plain text. """
+        try:
+            raw, safe = md.htmlStash.rawHtmlBlocks[int(m.group(1))]
+        except (IndexError, TypeError):  # pragma: no cover
+            return m.group(0)
+        if md.safeMode and not safe:  # pragma: no cover
+            return ''
+        # Strip out tags and entities - leaveing text
+        return re.sub(r'(<[^>]+>)|(&[\#a-zA-Z0-9]+;)', '', raw)
+
+    return HTML_PLACEHOLDER_RE.sub(_html_sub, text)
+
+
+def nest_toc_tokens(toc_list):
+    """Given an unsorted list with errors and skips, return a nested one.
+    [{'level': 1}, {'level': 2}]
+    =>
+    [{'level': 1, 'children': [{'level': 2, 'children': []}]}]
+
+    A wrong list is also converted:
+    [{'level': 2}, {'level': 1}]
+    =>
+    [{'level': 2, 'children': []}, {'level': 1, 'children': []}]
+    """
+
+    ordered_list = []
+    if len(toc_list):
+        # Initialize everything by processing the first entry
+        last = toc_list.pop(0)
+        last['children'] = []
+        levels = [last['level']]
+        ordered_list.append(last)
+        parents = []
+
+        # Walk the rest nesting the entries properly
+        while toc_list:
+            t = toc_list.pop(0)
+            current_level = t['level']
+            t['children'] = []
+
+            # Reduce depth if current level < last item's level
+            if current_level < levels[-1]:
+                # Pop last level since we know we are less than it
+                levels.pop()
+
+                # Pop parents and levels we are less than or equal to
+                to_pop = 0
+                for p in reversed(parents):
+                    if current_level <= p['level']:
+                        to_pop += 1
+                    else:  # pragma: no cover
+                        break
+                if to_pop:
+                    levels = levels[:-to_pop]
+                    parents = parents[:-to_pop]
+
+                # Note current level as last
+                levels.append(current_level)
+
+            # Level is the same, so append to
+            # the current parent (if available)
+            if current_level == levels[-1]:
+                (parents[-1]['children'] if parents
+                 else ordered_list).append(t)
+
+            # Current level is > last item's level,
+            # So make last item a parent and append current as child
+            else:
+                last['children'].append(t)
+                parents.append(last)
+                levels.append(current_level)
+            last = t
+
+    return ordered_list
+
+
+class TocTreeprocessor(Treeprocessor):
+    def __init__(self, md, config):
+        super(TocTreeprocessor, self).__init__(md)
+
+        self.marker = config["marker"]
+        self.title = config["title"]
+        self.base_level = int(config["baselevel"]) - 1
+        self.slugify = config["slugify"]
+        self.sep = config["separator"]
+        self.use_anchors = parseBoolValue(config["anchorlink"])
+        self.use_permalinks = parseBoolValue(config["permalink"], False)
+        if self.use_permalinks is None:
+            self.use_permalinks = config["permalink"]
+
+        self.header_rgx = re.compile("[Hh][123456]")
+
+    def iterparent(self, root):
+        ''' Iterator wrapper to get parent and child all at once. '''
+        for parent in root.iter():
+            for child in parent:
+                yield parent, child
+
+    def replace_marker(self, root, elem):
+        ''' Replace marker with elem. '''
+        for (p, c) in self.iterparent(root):
+            text = ''.join(c.itertext()).strip()
+            if not text:
+                continue
+
+            # To keep the output from screwing up the
+            # validation by putting a <div> inside of a <p>
+            # we actually replace the <p> in its entirety.
+            # We do not allow the marker inside a header as that
+            # would causes an enless loop of placing a new TOC
+            # inside previously generated TOC.
+            if c.text and c.text.strip() == self.marker and \
+               not self.header_rgx.match(c.tag) and c.tag not in ['pre', 'code']:
+                for i in range(len(p)):
+                    if p[i] == c:
+                        p[i] = elem
+                        break
+
+    def set_level(self, elem):
+        ''' Adjust header level according to base level. '''
+        level = int(elem.tag[-1]) + self.base_level
+        if level > 6:
+            level = 6
+        elem.tag = 'h%d' % level
+
+    def add_anchor(self, c, elem_id):  # @ReservedAssignment
+        anchor = etree.Element("a")
+        anchor.text = c.text
+        anchor.attrib["href"] = "#" + elem_id
+        anchor.attrib["class"] = "toclink"
+        c.text = ""
+        for elem in c:
+            anchor.append(elem)
+        while c:
+            c.remove(c[0])
+        c.append(anchor)
+
+    def add_permalink(self, c, elem_id):
+        permalink = etree.Element("a")
+        permalink.text = ("%spara;" % AMP_SUBSTITUTE
+                          if self.use_permalinks is True
+                          else self.use_permalinks)
+        permalink.attrib["href"] = "#" + elem_id
+        permalink.attrib["class"] = "headerlink"
+        permalink.attrib["title"] = "Permanent link"
+        c.append(permalink)
+
+    def build_toc_div(self, toc_list):
+        """ Return a string div given a toc list. """
+        div = etree.Element("div")
+        div.attrib["class"] = "toc"
+
+        # Add title to the div
+        if self.title:
+            header = etree.SubElement(div, "span")
+            header.attrib["class"] = "toctitle"
+            header.text = self.title
+
+        def build_etree_ul(toc_list, parent):
+            ul = etree.SubElement(parent, "ul")
+            for item in toc_list:
+                # List item link, to be inserted into the toc div
+                li = etree.SubElement(ul, "li")
+                link = etree.SubElement(li, "a")
+                link.text = item.get('name', '')
+                link.attrib["href"] = '#' + item.get('id', '')
+                if item['children']:
+                    build_etree_ul(item['children'], li)
+            return ul
+
+        build_etree_ul(toc_list, div)
+        prettify = self.markdown.treeprocessors.get('prettify')
+        if prettify:
+            prettify.run(div)
+        return div
+
+    def run(self, doc):
+        # Get a list of id attributes
+        used_ids = set()
+        for el in doc.iter():
+            if "id" in el.attrib:
+                used_ids.add(el.attrib["id"])
+
+        toc_tokens = []
+        for el in doc.iter():
+            if isinstance(el.tag, string_type) and self.header_rgx.match(el.tag):
+                self.set_level(el)
+                text = ''.join(el.itertext()).strip()
+
+                # Do not override pre-existing ids
+                if "id" not in el.attrib:
+                    innertext = stashedHTML2text(text, self.markdown)
+                    el.attrib["id"] = unique(self.slugify(innertext, self.sep), used_ids)
+
+                toc_tokens.append({
+                    'level': int(el.tag[-1]),
+                    'id': el.attrib["id"],
+                    'name': text
+                })
+
+                if self.use_anchors:
+                    self.add_anchor(el, el.attrib["id"])
+                if self.use_permalinks:
+                    self.add_permalink(el, el.attrib["id"])
+
+        div = self.build_toc_div(nest_toc_tokens(toc_tokens))
+        if self.marker:
+            self.replace_marker(doc, div)
+
+        # serialize and attach to markdown instance.
+        toc = self.markdown.serializer(div)
+        for pp in self.markdown.postprocessors.values():
+            toc = pp.run(toc)
+        self.markdown.toc = toc
+
+
+class TocExtension(Extension):
+
+    TreeProcessorClass = TocTreeprocessor
+
+    def __init__(self, *args, **kwargs):
+        self.config = {
+            "marker": ['[TOC]',
+                       'Text to find and replace with Table of Contents - '
+                       'Set to an empty string to disable. Defaults to "[TOC]"'],
+            "title": ["",
+                      "Title to insert into TOC <div> - "
+                      "Defaults to an empty string"],
+            "anchorlink": [False,
+                           "True if header should be a self link - "
+                           "Defaults to False"],
+            "permalink": [0,
+                          "True or link text if a Sphinx-style permalink should "
+                          "be added - Defaults to False"],
+            "baselevel": ['1', 'Base level for headers.'],
+            "slugify": [slugify,
+                        "Function to generate anchors based on header text - "
+                        "Defaults to the headerid ext's slugify function."],
+            'separator': ['-', 'Word separator. Defaults to "-".']
+        }
+
+        super(TocExtension, self).__init__(*args, **kwargs)
+
+    def extendMarkdown(self, md, md_globals):
+        md.registerExtension(self)
+        self.md = md
+        self.reset()
+        tocext = self.TreeProcessorClass(md, self.getConfigs())
+        # Headerid ext is set to '>prettify'. With this set to '_end',
+        # it should always come after headerid ext (and honor ids assinged
+        # by the header id extension) if both are used. Same goes for
+        # attr_list extension. This must come last because we don't want
+        # to redefine ids after toc is created. But we do want toc prettified.
+        md.treeprocessors.add("toc", tocext, "_end")
+
+    def reset(self):
+        self.md.toc = ''
+
+
+def makeExtension(*args, **kwargs):
+    return TocExtension(*args, **kwargs)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="Created" POS="N" name="utility.n" ID="11625" frame="Usefulness" frameID="726" totalAnnotated="3" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <corpus description="Texts from Nuclear Threat Initiative website, created by Center for Non-Proliferation Studies" name="NTI" ID="135">
+            <document description="Iran Biological" name="Iran_Biological" ID="23513"/>
+            <document description="South Africa Introduction" name="SouthAfrica_Introduction" ID="23571"/>
+            <document description="North Korea Chemical Overview" name="NorthKorea_ChemicalOverview" ID="23611"/>
+        </corpus>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="FF00FF" type="Peripheral" abbrev="Deg" name="Degree"/>
+            <FE fgColor="FFFFFF" bgColor="A52A2A" type="Extra-Thematic" abbrev="dom" name="Domain"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="Ent" name="Entity"/>
+            <FE fgColor="FFFFFF" bgColor="800080" type="Core" abbrev="Purp" name="Purpose"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Peripheral" abbrev="" name="Time"/>
+        </frame>
+    </header>
+    <definition>COD: the state of being useful, profitable, or beneficial.</definition>
+    <lexeme POS="N" name="utility"/>
+    <valences>
+        <FERealization total="3">
+            <FE name="Entity"/>
+            <pattern total="3">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Entity"/>
+                <annoSet ID="6523648"/>
+                <annoSet ID="6533858"/>
+                <annoSet ID="6536156"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Purpose"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[for]" FE="Purpose"/>
+                <annoSet ID="6533858"/>
+            </pattern>
+        </FERealization>
+        <FEGroupRealization total="2">
+            <FE name="Entity"/>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Entity"/>
+                <annoSet ID="6523648"/>
+                <annoSet ID="6536156"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Entity"/>
+            <FE name="Purpose"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Entity"/>
+                <valenceUnit GF="Dep" PT="PP[for]" FE="Purpose"/>
+                <annoSet ID="6533858"/>
+            </pattern>
+        </FEGroupRealization>
+    </valences>
+    <subCorpus name="manually-added">
+        <sentence corpID="135" docID="23513" sentNo="4" paragNo="15" aPos="0" ID="4096930">
+            <text>While this could be true , it should be noted that the utility of these fungal species is not limited to BW applications .</text>
+            <annotationSet cDate="02/25/2005 12:37:33 PST Fri" status="UNANN" ID="6522595">
+                <layer rank="1" name="PENN">
+                    <label end="4" start="0" name="in"/>
+                    <label end="9" start="6" name="dt"/>
+                    <label end="15" start="11" name="md"/>
+                    <label end="18" start="17" name="vb"/>
+                    <label end="23" start="20" name="jj"/>
+                    <label end="25" start="25" name=","/>
+                    <label end="28" start="27" name="PP"/>
+                    <label end="35" start="30" name="md"/>
+                    <label end="38" start="37" name="vb"/>
+                    <label end="44" start="40" name="VVN"/>
+                    <label end="49" start="46" name="in"/>
+                    <label end="53" start="51" name="dt"/>
+                    <label end="61" start="55" name="nn"/>
+                    <label end="64" start="63" name="in"/>
+                    <label end="70" start="66" name="dt"/>
+                    <label end="77" start="72" name="jj"/>
+                    <label end="85" start="79" name="nn"/>
+                    <label end="88" start="87" name="VBZ"/>
+                    <label end="92" start="90" name="rb"/>
+                    <label end="100" start="94" name="VVN"/>
+                    <label end="103" start="102" name="to"/>
+                    <label end="106" start="105" name="NP"/>
+                    <label end="119" start="108" name="nns"/>
+                    <label end="121" start="121" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="106" start="105" name="WEA"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="4" start="0" name="NT"/>
+                    <label end="9" start="6" name="NT"/>
+                    <label end="15" start="11" name="NT"/>
+                    <label end="25" start="25" name="NT"/>
+                    <label end="28" start="27" name="NT"/>
+                    <label end="35" start="30" name="NT"/>
+                    <label end="49" start="46" name="NT"/>
+                    <label end="53" start="51" name="NT"/>
+                    <label end="64" start="63" name="NT"/>
+                    <label end="70" start="66" name="NT"/>
+                    <label end="103" start="102" name="NT"/>
+                    <label end="121" start="121" name="NT"/>
+                    <label end="18" start="17" name="NT"/>
+                    <label end="38" start="37" name="NT"/>
+                    <label end="88" start="87" name="NT"/>
+                    <label end="92" start="90" name="NT"/>
+                    <label end="106" start="105" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/03/2005 05:14:00 PST Thu" status="MANUAL" ID="6523648">
+                <layer rank="1" name="Target">
+                    <label cBy="JKR" end="61" start="55" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="JKR" feID="4783" end="85" start="63" name="Entity"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="85" start="63" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="85" start="63" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23571" sentNo="1" paragNo="4" aPos="0" ID="4097887">
+            <text>In the 1960s , South Africa began to explore the technical utility of `` peaceful nuclear explosions '' for mining and engineering purposes .</text>
+            <annotationSet cDate="09/28/2005 02:29:55 PDT Wed" status="UNANN" ID="6530626">
+                <layer rank="1" name="PENN">
+                    <label end="1" start="0" name="in"/>
+                    <label end="5" start="3" name="dt"/>
+                    <label end="11" start="7" name="nns"/>
+                    <label end="13" start="13" name=","/>
+                    <label end="19" start="15" name="NP"/>
+                    <label end="26" start="21" name="NP"/>
+                    <label end="32" start="28" name="VVD"/>
+                    <label end="35" start="34" name="to"/>
+                    <label end="43" start="37" name="VV"/>
+                    <label end="47" start="45" name="dt"/>
+                    <label end="57" start="49" name="jj"/>
+                    <label end="65" start="59" name="nn"/>
+                    <label end="68" start="67" name="in"/>
+                    <label end="71" start="70" name="``"/>
+                    <label end="80" start="73" name="jj"/>
+                    <label end="88" start="82" name="jj"/>
+                    <label end="99" start="90" name="nns"/>
+                    <label end="102" start="101" name="''"/>
+                    <label end="106" start="104" name="in"/>
+                    <label end="113" start="108" name="nn"/>
+                    <label end="117" start="115" name="cc"/>
+                    <label end="129" start="119" name="nn"/>
+                    <label end="138" start="131" name="nns"/>
+                    <label end="140" start="140" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="11" start="7" name="date"/>
+                    <label end="26" start="15" name="location"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="1" start="0" name="NT"/>
+                    <label end="5" start="3" name="NT"/>
+                    <label end="13" start="13" name="NT"/>
+                    <label end="19" start="15" name="NT"/>
+                    <label end="26" start="21" name="NT"/>
+                    <label end="35" start="34" name="NT"/>
+                    <label end="47" start="45" name="NT"/>
+                    <label end="68" start="67" name="NT"/>
+                    <label end="71" start="70" name="NT"/>
+                    <label end="102" start="101" name="NT"/>
+                    <label end="106" start="104" name="NT"/>
+                    <label end="117" start="115" name="NT"/>
+                    <label end="140" start="140" name="NT"/>
+                    <label end="88" start="82" name="Nonrelational"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="02/14/2006 08:45:41 PST Tue" status="MANUAL" ID="6533858">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="65" start="59" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="4783" end="102" start="67" name="Entity"/>
+                    <label cBy="RLG" feID="4784" end="138" start="104" name="Purpose"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="102" start="67" name="Dep"/>
+                    <label end="138" start="104" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="102" start="67" name="PP"/>
+                    <label end="138" start="104" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23611" sentNo="2" paragNo="5" aPos="0" ID="4099672">
+            <text>It noted the utility of forcing the enemy to `` suit up '' in preparation for real or imagined use of chemical agents , for doing so would degrade the fighting ability of enemy forces .</text>
+            <annotationSet cDate="06/27/2006 04:44:57 PDT Tue" status="UNANN" ID="6535880">
+                <layer rank="1" name="PENN">
+                    <label end="1" start="0" name="PP"/>
+                    <label end="7" start="3" name="VVD"/>
+                    <label end="11" start="9" name="dt"/>
+                    <label end="19" start="13" name="nn"/>
+                    <label end="22" start="21" name="in"/>
+                    <label end="30" start="24" name="VVG"/>
+                    <label end="34" start="32" name="dt"/>
+                    <label end="40" start="36" name="nn"/>
+                    <label end="43" start="42" name="to"/>
+                    <label end="46" start="45" name="``"/>
+                    <label end="51" start="48" name="VV"/>
+                    <label end="54" start="53" name="rb"/>
+                    <label end="57" start="56" name="''"/>
+                    <label end="60" start="59" name="in"/>
+                    <label end="72" start="62" name="nn"/>
+                    <label end="76" start="74" name="in"/>
+                    <label end="81" start="78" name="jj"/>
+                    <label end="84" start="83" name="cc"/>
+                    <label end="93" start="86" name="VVN"/>
+                    <label end="97" start="95" name="nn"/>
+                    <label end="100" start="99" name="in"/>
+                    <label end="109" start="102" name="jj"/>
+                    <label end="116" start="111" name="nns"/>
+                    <label end="118" start="118" name=","/>
+                    <label end="122" start="120" name="in"/>
+                    <label end="128" start="124" name="VVG"/>
+                    <label end="131" start="130" name="rb"/>
+                    <label end="137" start="133" name="md"/>
+                    <label end="145" start="139" name="VV"/>
+                    <label end="149" start="147" name="dt"/>
+                    <label end="158" start="151" name="VVG"/>
+                    <label end="166" start="160" name="nn"/>
+                    <label end="169" start="168" name="in"/>
+                    <label end="175" start="171" name="nn"/>
+                    <label end="182" start="177" name="nns"/>
+                    <label end="184" start="184" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL">
+                    <label end="1" start="0" name="NT"/>
+                    <label end="11" start="9" name="NT"/>
+                    <label end="22" start="21" name="NT"/>
+                    <label end="34" start="32" name="NT"/>
+                    <label end="43" start="42" name="NT"/>
+                    <label end="46" start="45" name="NT"/>
+                    <label end="54" start="53" name="NT"/>
+                    <label end="57" start="56" name="NT"/>
+                    <label end="60" start="59" name="NT"/>
+                    <label end="76" start="74" name="NT"/>
+                    <label end="84" start="83" name="NT"/>
+                    <label end="100" start="99" name="NT"/>
+                    <label end="118" start="118" name="NT"/>
+                    <label end="122" start="120" name="NT"/>
+                    <label end="128" start="124" name="NT"/>
+                    <label end="131" start="130" name="NT"/>
+                    <label end="137" start="133" name="NT"/>
+                    <label end="149" start="147" name="NT"/>
+                    <label end="169" start="168" name="NT"/>
+                    <label end="184" start="184" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="06/30/2006 11:29:50 PDT Fri" status="MANUAL" ID="6536156">
+                <layer rank="1" name="Target">
+                    <label cBy="KmG" end="19" start="13" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="KmG" feID="4783" end="116" start="21" name="Entity"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="116" start="21" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="116" start="21" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+</lexUnit>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         

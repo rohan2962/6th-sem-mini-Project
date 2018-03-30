@@ -1,0 +1,1371 @@
+from __future__ import absolute_import, division, unicode_literals
+from six import text_type
+
+import re
+
+from . import _base
+from .. import ihatexml
+from .. import constants
+from ..constants import namespaces
+from ..utils import moduleFactoryFactory
+
+tag_regexp = re.compile("{([^}]*)}(.*)")
+
+
+def getETreeBuilder(ElementTreeImplementation, fullTree=False):
+    ElementTree = ElementTreeImplementation
+    ElementTreeCommentType = ElementTree.Comment("asd").tag
+
+    class Element(_base.Node):
+        def __init__(self, name, namespace=None):
+            self._name = name
+            self._namespace = namespace
+            self._element = ElementTree.Element(self._getETreeTag(name,
+                                                                  namespace))
+            if namespace is None:
+                self.nameTuple = namespaces["html"], self._name
+            else:
+                self.nameTuple = self._namespace, self._name
+            self.parent = None
+            self._childNodes = []
+            self._flags = []
+
+        def _getETreeTag(self, name, namespace):
+            if namespace is None:
+                etree_tag = name
+            else:
+                etree_tag = "{%s}%s" % (namespace, name)
+            return etree_tag
+
+        def _setName(self, name):
+            self._name = name
+            self._element.tag = self._getETreeTag(self._name, self._namespace)
+
+        def _getName(self):
+            return self._name
+
+        name = property(_getName, _setName)
+
+        def _setNamespace(self, namespace):
+            self._namespace = namespace
+            self._element.tag = self._getETreeTag(self._name, self._namespace)
+
+        def _getNamespace(self):
+            return self._namespace
+
+        namespace = property(_getNamespace, _setNamespace)
+
+        def _getAttributes(self):
+            return self._element.attrib
+
+        def _setAttributes(self, attributes):
+            # Delete existing attributes first
+            # XXX - there may be a better way to do this...
+            for key in list(self._element.attrib.keys()):
+                del self._element.attrib[key]
+            for key, value in attributes.items():
+                if isinstance(key, tuple):
+                    name = "{%s}%s" % (key[2], key[1])
+                else:
+                    name = key
+                self._element.set(name, value)
+
+        attributes = property(_getAttributes, _setAttributes)
+
+        def _getChildNodes(self):
+            return self._childNodes
+
+        def _setChildNodes(self, value):
+            del self._element[:]
+            self._childNodes = []
+            for element in value:
+                self.insertChild(element)
+
+        childNodes = property(_getChildNodes, _setChildNodes)
+
+        def hasContent(self):
+            """Return true if the node has children or text"""
+            return bool(self._element.text or len(self._element))
+
+        def appendChild(self, node):
+            self._childNodes.append(node)
+            self._element.append(node._element)
+            node.parent = self
+
+        def insertBefore(self, node, refNode):
+            index = list(self._element).index(refNode._element)
+            self._element.insert(index, node._element)
+            node.parent = self
+
+        def removeChild(self, node):
+            self._element.remove(node._element)
+            node.parent = None
+
+        def insertText(self, data, insertBefore=None):
+            if not(len(self._element)):
+                if not self._element.text:
+                    self._element.text = ""
+                self._element.text += data
+            elif insertBefore is None:
+                # Insert the text as the tail of the last child element
+                if not self._element[-1].tail:
+                    self._element[-1].tail = ""
+                self._element[-1].tail += data
+            else:
+                # Insert the text before the specified node
+                children = list(self._element)
+                index = children.index(insertBefore._element)
+                if index > 0:
+                    if not self._element[index - 1].tail:
+                        self._element[index - 1].tail = ""
+                    self._element[index - 1].tail += data
+                else:
+                    if not self._element.text:
+                        self._element.text = ""
+                    self._element.text += data
+
+        def cloneNode(self):
+            element = type(self)(self.name, self.namespace)
+            for name, value in self.attributes.items():
+                element.attributes[name] = value
+            return element
+
+        def reparentChildren(self, newParent):
+            if newParent.childNodes:
+                newParent.childNodes[-1]._element.tail += self._element.text
+            else:
+                if not newParent._element.text:
+                    newParent._element.text = ""
+                if self._element.text is not None:
+                    newParent._element.text += self._element.text
+            self._element.text = ""
+            _base.Node.reparentChildren(self, newParent)
+
+    class Comment(Element):
+        def __init__(self, data):
+            # Use the superclass constructor to set all properties on the
+            # wrapper element
+            self._element = ElementTree.Comment(data)
+            self.parent = None
+            self._childNodes = []
+            self._flags = []
+
+        def _getData(self):
+            return self._element.text
+
+        def _setData(self, value):
+            self._element.text = value
+
+        data = property(_getData, _setData)
+
+    class DocumentType(Element):
+        def __init__(self, name, publicId, systemId):
+            Element.__init__(self, "<!DOCTYPE>")
+            self._element.text = name
+            self.publicId = publicId
+            self.systemId = systemId
+
+        def _getPublicId(self):
+            return self._element.get("publicId", "")
+
+        def _setPublicId(self, value):
+            if value is not None:
+                self._element.set("publicId", value)
+
+        publicId = property(_getPublicId, _setPublicId)
+
+        def _getSystemId(self):
+            return self._element.get("systemId", "")
+
+        def _setSystemId(self, value):
+            if value is not None:
+                self._element.set("systemId", value)
+
+        systemId = property(_getSystemId, _setSystemId)
+
+    class Document(Element):
+        def __init__(self):
+            Element.__init__(self, "DOCUMENT_ROOT")
+
+    class DocumentFragment(Element):
+        def __init__(self):
+            Element.__init__(self, "DOCUMENT_FRAGMENT")
+
+    def testSerializer(element):
+        rv = []
+
+        def serializeElement(element, indent=0):
+            if not(hasattr(element, "tag")):
+                element = element.getroot()
+            if element.tag == "<!DOCTYPE>":
+                if element.get("publicId") or element.get("systemId"):
+                    publicId = element.get("publicId") or ""
+                    systemId = element.get("systemId") or ""
+                    rv.append("""<!DOCTYPE %s "%s" "%s">""" %
+                              (element.text, publicId, systemId))
+                else:
+                    rv.append("<!DOCTYPE %s>" % (element.text,))
+            elif element.tag == "DOCUMENT_ROOT":
+                rv.append("#document")
+                if element.text is not None:
+                    rv.append("|%s\"%s\"" % (' ' * (indent + 2), element.text))
+                if element.tail is not None:
+                    raise TypeError("Document node cannot have tail")
+                if hasattr(element, "attrib") and len(element.attrib):
+                    raise TypeError("Document node cannot have attributes")
+            elif element.tag == ElementTreeCommentType:
+                rv.append("|%s<!-- %s -->" % (' ' * indent, element.text))
+            else:
+                assert isinstance(element.tag, text_type), \
+                    "Expected unicode, got %s, %s" % (type(element.tag), element.tag)
+                nsmatch = tag_regexp.match(element.tag)
+
+                if nsmatch is None:
+                    name = element.tag
+                else:
+                    ns, name = nsmatch.groups()
+                    prefix = constants.prefixes[ns]
+                    name = "%s %s" % (prefix, name)
+                rv.append("|%s<%s>" % (' ' * indent, name))
+
+                if hasattr(element, "attrib"):
+                    attributes = []
+                    for name, value in element.attrib.items():
+                        nsmatch = tag_regexp.match(name)
+                        if nsmatch is not None:
+                            ns, name = nsmatch.groups()
+                            prefix = constants.prefixes[ns]
+                            attr_string = "%s %s" % (prefix, name)
+                        else:
+                            attr_string = name
+                        attributes.append((attr_string, value))
+
+                    for name, value in sorted(attributes):
+                        rv.append('|%s%s="%s"' % (' ' * (indent + 2), name, value))
+                if element.text:
+                    rv.append("|%s\"%s\"" % (' ' * (indent + 2), element.text))
+            indent += 2
+            for child in element:
+                serializeElement(child, indent)
+            if element.tail:
+                rv.append("|%s\"%s\"" % (' ' * (indent - 2), element.tail))
+        serializeElement(element, 0)
+
+        return "\n".join(rv)
+
+    def tostring(element):
+        """Serialize an element and its child nodes to a string"""
+        rv = []
+        filter = ihatexml.InfosetFilter()
+
+        def serializeElement(element):
+            if isinstance(element, ElementTree.ElementTree):
+                element = element.getroot()
+
+            if element.tag == "<!DOCTYPE>":
+                if element.get("publicId") or element.get("systemId"):
+                    publicId = element.get("publicId") or ""
+                    systemId = element.get("systemId") or ""
+                    rv.append("""<!DOCTYPE %s PUBLIC "%s" "%s">""" %
+                              (element.text, publicId, systemId))
+                else:
+                    rv.append("<!DOCTYPE %s>" % (element.text,))
+            elif element.tag == "DOCUMENT_ROOT":
+                if element.text is not None:
+                    rv.append(element.text)
+                if element.tail is not None:
+                    raise TypeError("Document node cannot have tail")
+                if hasattr(element, "attrib") and len(element.attrib):
+                    raise TypeError("Document node cannot have attributes")
+
+                for child in element:
+                    serializeElement(child)
+
+            elif element.tag == ElementTreeCommentType:
+                rv.append("<!--%s-->" % (element.text,))
+            else:
+                # This is assumed to be an ordinary element
+                if not element.attrib:
+                    rv.append("<%s>" % (filter.fromXmlName(element.tag),))
+                else:
+                    attr = " ".join(["%s=\"%s\"" % (
+                        filter.fromXmlName(name), value)
+                        for name, value in element.attrib.items()])
+                    rv.append("<%s %s>" % (element.tag, attr))
+                if element.text:
+                    rv.append(element.text)
+
+                for child in element:
+                    serializeElement(child)
+
+                rv.append("</%s>" % (element.tag,))
+
+            if element.tail:
+                rv.append(element.tail)
+
+        serializeElement(element)
+
+        return "".join(rv)
+
+    class TreeBuilder(_base.TreeBuilder):
+        documentClass = Document
+        doctypeClass = DocumentType
+        elementClass = Element
+        commentClass = Comment
+        fragmentClass = DocumentFragment
+        implementation = ElementTreeImplementation
+
+        def testSerializer(self, element):
+            return testSerializer(element)
+
+        def getDocument(self):
+            if fullTree:
+                return self.document._element
+            else:
+                if self.defaultNamespace is not None:
+                    return self.document._element.find(
+                        "{%s}html" % self.defaultNamespace)
+                else:
+                    return self.document._element.find("html")
+
+        def getFragment(self):
+            return _base.TreeBuilder.getFragment(self)._element
+
+    return locals()
+
+
+getETreeModule = moduleFactoryFactory(getETreeBuilder)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="FN1_Sent" POS="V" name="slink.v" ID="1223" frame="Self_motion" frameID="64" totalAnnotated="49" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="A52A2A" type="Core" abbrev="Area" name="Area"/>
+            <FE fgColor="000000" bgColor="FF0000" type="Extra-Thematic" abbrev="" name="Concessive"/>
+            <FE fgColor="000000" bgColor="A52A2A" type="Extra-Thematic" abbrev="coo" name="Coordinated_event"/>
+            <FE fgColor="FFFFFF" bgColor="808080" type="Extra-Thematic" abbrev="Thm_c" name="Cotheme"/>
+            <FE fgColor="FFFFFF" bgColor="9400D3" type="Extra-Thematic" abbrev="Dep" name="Depictive"/>
+            <FE fgColor="000000" bgColor="d0d0d0" type="Core" abbrev="dir" name="Direction"/>
+            <FE fgColor="000000" bgColor="FFFF00" type="Peripheral" abbrev="Dist" name="Distance"/>
+            <FE fgColor="FFFFFF" bgColor="9F79EE" type="Peripheral" abbrev="Dur" name="Duration"/>
+            <FE fgColor="FFFFFF" bgColor="A9A9A9" type="Extra-Thematic" abbrev="Exp" name="Explanation"/>
+            <FE fgColor="FFFFFF" bgColor="90876C" type="Extra-Thematic" abbrev="ext" name="External_cause"/>
+            <FE fgColor="FFFFFF" bgColor="00BFFF" type="Core" abbrev="Goal" name="Goal"/>
+            <FE fgColor="FFFFFF" bgColor="2E8B57" type="Extra-Thematic" abbrev="Cause" name="Internal_cause"/>
+            <FE fgColor="FFFFFF" bgColor="FF00FF" type="Peripheral" abbrev="Manr" name="Manner"/>
+            <FE fgColor="FFFFFF" bgColor="FF69B4" type="Peripheral" abbrev="Mns" name="Means"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="Path" name="Path"/>
+            <FE fgColor="000000" bgColor="FF00FF" type="Peripheral" abbrev="" name="Path_shape"/>
+            <FE fgColor="FFFFFF" bgColor="008000" type="Peripheral" abbrev="" name="Place"/>
+            <FE fgColor="FFFFFF" bgColor="800080" type="Peripheral" abbrev="Purp" name="Purpose"/>
+            <FE fgColor="FFFFFF" bgColor="7CCD73" type="Extra-Thematic" abbrev="Result" name="Result"/>
+            <FE fgColor="FFFFFF" bgColor="FF0000" type="Core" abbrev="SMov" name="Self_mover"/>
+            <FE fgColor="FFFFFF" bgColor="006400" type="Core" abbrev="Src" name="Source"/>
+            <FE fgColor="FFFFFF" bgColor="1E90FF" type="Peripheral" abbrev="Spd" name="Speed"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Peripheral" abbrev="Time" name="Time"/>
+        </frame>
+    </header>
+    <definition>FN: move in a quiet, furtive manner</definition>
+    <lexeme POS="V" name="slink"/>
+    <valences>
+        <FERealization total="2">
+            <FE name="Area"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[about]" FE="Area"/>
+                <annoSet ID="972989"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[beneath]" FE="Area"/>
+                <annoSet ID="972931"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Cotheme"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="NP" FE="Cotheme"/>
+                <annoSet ID="972903"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="24">
+            <FE name="Goal"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Goal"/>
+                <annoSet ID="973007"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[behind]" FE="Goal"/>
+                <annoSet ID="972999"/>
+            </pattern>
+            <pattern total="4">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Goal"/>
+                <annoSet ID="972981"/>
+                <annoSet ID="972991"/>
+                <annoSet ID="973013"/>
+                <annoSet ID="973015"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[inside]" FE="Goal"/>
+                <annoSet ID="972915"/>
+            </pattern>
+            <pattern total="12">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <annoSet ID="972917"/>
+                <annoSet ID="972919"/>
+                <annoSet ID="972921"/>
+                <annoSet ID="972925"/>
+                <annoSet ID="972929"/>
+                <annoSet ID="972933"/>
+                <annoSet ID="972993"/>
+                <annoSet ID="972995"/>
+                <annoSet ID="972997"/>
+                <annoSet ID="973009"/>
+                <annoSet ID="973019"/>
+                <annoSet ID="973027"/>
+            </pattern>
+            <pattern total="5">
+                <valenceUnit GF="Dep" PT="PP[to]" FE="Goal"/>
+                <annoSet ID="972947"/>
+                <annoSet ID="973001"/>
+                <annoSet ID="973005"/>
+                <annoSet ID="973011"/>
+                <annoSet ID="973023"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="8">
+            <FE name="Manner"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Manner"/>
+                <annoSet ID="972989"/>
+            </pattern>
+            <pattern total="6">
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <annoSet ID="972929"/>
+                <annoSet ID="972931"/>
+                <annoSet ID="972941"/>
+                <annoSet ID="972997"/>
+                <annoSet ID="973001"/>
+                <annoSet ID="973031"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[with]" FE="Manner"/>
+                <annoSet ID="972907"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="13">
+            <FE name="Path"/>
+            <pattern total="1">
+                <valenceUnit GF="" PT="INI" FE="Path"/>
+                <annoSet ID="972903"/>
+            </pattern>
+            <pattern total="4">
+                <valenceUnit GF="Dep" PT="PP[through]" FE="Path"/>
+                <annoSet ID="972941"/>
+                <annoSet ID="972943"/>
+                <annoSet ID="972945"/>
+                <annoSet ID="973025"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[along]" FE="Path"/>
+                <annoSet ID="972907"/>
+                <annoSet ID="972961"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="AVP" FE="Path"/>
+                <annoSet ID="972899"/>
+                <annoSet ID="972973"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[across]" FE="Path"/>
+                <annoSet ID="972905"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[by]" FE="Path"/>
+                <annoSet ID="973029"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[down]" FE="Path"/>
+                <annoSet ID="972975"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Path"/>
+                <annoSet ID="972977"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Result"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Result"/>
+                <annoSet ID="972931"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="49">
+            <FE name="Self_mover"/>
+            <pattern total="45">
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972899"/>
+                <annoSet ID="972903"/>
+                <annoSet ID="972905"/>
+                <annoSet ID="972907"/>
+                <annoSet ID="972911"/>
+                <annoSet ID="972915"/>
+                <annoSet ID="972921"/>
+                <annoSet ID="972925"/>
+                <annoSet ID="972929"/>
+                <annoSet ID="972931"/>
+                <annoSet ID="972933"/>
+                <annoSet ID="972941"/>
+                <annoSet ID="972943"/>
+                <annoSet ID="972945"/>
+                <annoSet ID="972949"/>
+                <annoSet ID="972953"/>
+                <annoSet ID="972955"/>
+                <annoSet ID="972961"/>
+                <annoSet ID="972963"/>
+                <annoSet ID="972965"/>
+                <annoSet ID="972973"/>
+                <annoSet ID="972977"/>
+                <annoSet ID="972981"/>
+                <annoSet ID="972983"/>
+                <annoSet ID="972985"/>
+                <annoSet ID="972987"/>
+                <annoSet ID="972989"/>
+                <annoSet ID="972991"/>
+                <annoSet ID="972993"/>
+                <annoSet ID="972995"/>
+                <annoSet ID="972997"/>
+                <annoSet ID="972999"/>
+                <annoSet ID="973001"/>
+                <annoSet ID="973005"/>
+                <annoSet ID="973007"/>
+                <annoSet ID="973009"/>
+                <annoSet ID="973011"/>
+                <annoSet ID="973013"/>
+                <annoSet ID="973015"/>
+                <annoSet ID="973019"/>
+                <annoSet ID="973023"/>
+                <annoSet ID="973025"/>
+                <annoSet ID="973027"/>
+                <annoSet ID="973029"/>
+                <annoSet ID="973031"/>
+            </pattern>
+            <pattern total="4">
+                <valenceUnit GF="" PT="CNI" FE="Self_mover"/>
+                <annoSet ID="972917"/>
+                <annoSet ID="972919"/>
+                <annoSet ID="972947"/>
+                <annoSet ID="972975"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="18">
+            <FE name="Source"/>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[from]" FE="Source"/>
+                <annoSet ID="972911"/>
+                <annoSet ID="973007"/>
+            </pattern>
+            <pattern total="5">
+                <valenceUnit GF="Dep" PT="AVP" FE="Source"/>
+                <annoSet ID="972963"/>
+                <annoSet ID="972965"/>
+                <annoSet ID="972991"/>
+                <annoSet ID="972993"/>
+                <annoSet ID="973031"/>
+            </pattern>
+            <pattern total="4">
+                <valenceUnit GF="Dep" PT="PP[off]" FE="Source"/>
+                <annoSet ID="972983"/>
+                <annoSet ID="972985"/>
+                <annoSet ID="973019"/>
+                <annoSet ID="973023"/>
+            </pattern>
+            <pattern total="7">
+                <valenceUnit GF="Dep" PT="PP[out]" FE="Source"/>
+                <annoSet ID="972949"/>
+                <annoSet ID="972953"/>
+                <annoSet ID="972955"/>
+                <annoSet ID="972987"/>
+                <annoSet ID="973025"/>
+                <annoSet ID="973027"/>
+                <annoSet ID="973029"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="4">
+            <FE name="Time"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="Sinterrog" FE="Time"/>
+                <annoSet ID="972989"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[at]" FE="Time"/>
+                <annoSet ID="973015"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="AVP" FE="Time"/>
+                <annoSet ID="972899"/>
+                <annoSet ID="972997"/>
+            </pattern>
+        </FERealization>
+        <FEGroupRealization total="1">
+            <FE name="Area"/>
+            <FE name="Manner"/>
+            <FE name="Result"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[beneath]" FE="Area"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Result"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972931"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Area"/>
+            <FE name="Manner"/>
+            <FE name="Self_mover"/>
+            <FE name="Time"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[about]" FE="Area"/>
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="Sinterrog" FE="Time"/>
+                <annoSet ID="972989"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Cotheme"/>
+            <FE name="Path"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="NP" FE="Cotheme"/>
+                <valenceUnit GF="" PT="INI" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972903"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="2">
+            <FE name="Goal"/>
+            <FE name="Manner"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972929"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[to]" FE="Goal"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="973001"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Goal"/>
+            <FE name="Manner"/>
+            <FE name="Self_mover"/>
+            <FE name="Time"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Time"/>
+                <annoSet ID="972997"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="14">
+            <FE name="Goal"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[behind]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972999"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972981"/>
+                <annoSet ID="973013"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[inside]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972915"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="" PT="CNI" FE="Self_mover"/>
+                <annoSet ID="972917"/>
+                <annoSet ID="972919"/>
+            </pattern>
+            <pattern total="5">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972921"/>
+                <annoSet ID="972925"/>
+                <annoSet ID="972933"/>
+                <annoSet ID="972995"/>
+                <annoSet ID="973009"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[to]" FE="Goal"/>
+                <valenceUnit GF="" PT="CNI" FE="Self_mover"/>
+                <annoSet ID="972947"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[to]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="973005"/>
+                <annoSet ID="973011"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="6">
+            <FE name="Goal"/>
+            <FE name="Self_mover"/>
+            <FE name="Source"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[from]" FE="Source"/>
+                <annoSet ID="973007"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Source"/>
+                <annoSet ID="972991"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Source"/>
+                <annoSet ID="972993"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[off]" FE="Source"/>
+                <annoSet ID="973019"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[into]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[out]" FE="Source"/>
+                <annoSet ID="973027"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[to]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[off]" FE="Source"/>
+                <annoSet ID="973023"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Goal"/>
+            <FE name="Self_mover"/>
+            <FE name="Time"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Goal"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[at]" FE="Time"/>
+                <annoSet ID="973015"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="2">
+            <FE name="Manner"/>
+            <FE name="Path"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Dep" PT="PP[through]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972941"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[with]" FE="Manner"/>
+                <valenceUnit GF="Dep" PT="PP[along]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972907"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Manner"/>
+            <FE name="Self_mover"/>
+            <FE name="Source"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Source"/>
+                <annoSet ID="973031"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="7">
+            <FE name="Path"/>
+            <FE name="Self_mover"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972973"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[across]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972905"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[along]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972961"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[down]" FE="Path"/>
+                <valenceUnit GF="" PT="CNI" FE="Self_mover"/>
+                <annoSet ID="972975"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972977"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="PP[through]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <annoSet ID="972943"/>
+                <annoSet ID="972945"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="2">
+            <FE name="Path"/>
+            <FE name="Self_mover"/>
+            <FE name="Source"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[by]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[out]" FE="Source"/>
+                <annoSet ID="973029"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[through]" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[out]" FE="Source"/>
+                <annoSet ID="973025"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Path"/>
+            <FE name="Self_mover"/>
+            <FE name="Time"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Path"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Time"/>
+                <annoSet ID="972899"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="9">
+            <FE name="Self_mover"/>
+            <FE name="Source"/>
+            <pattern total="2">
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="AVP" FE="Source"/>
+                <annoSet ID="972963"/>
+                <annoSet ID="972965"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[from]" FE="Source"/>
+                <annoSet ID="972911"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[off]" FE="Source"/>
+                <annoSet ID="972983"/>
+                <annoSet ID="972985"/>
+            </pattern>
+            <pattern total="4">
+                <valenceUnit GF="Ext" PT="NP" FE="Self_mover"/>
+                <valenceUnit GF="Dep" PT="PP[out]" FE="Source"/>
+                <annoSet ID="972949"/>
+                <annoSet ID="972953"/>
+                <annoSet ID="972955"/>
+                <annoSet ID="972987"/>
+            </pattern>
+        </FEGroupRealization>
+    </valences>
+    <subCorpus name="V-660-trans-simple"/>
+    <subCorpus name="V-690-trans-other">
+        <sentence sentNo="0" aPos="66403644" ID="756543">
+            <text>It was with a sense of relief that we slunk east again , through a surprising ( but apparently intermittent ) east-west tide rip through the narrows of Akar Bogazi , for Kekova Roads . </text>
+            <annotationSet cDate="01/07/2003 01:19:41 PST Tue" status="UNANN" ID="972898">
+                <layer rank="1" name="BNC">
+                    <label end="1" start="0" name="PNP"/>
+                    <label end="5" start="3" name="VBD"/>
+                    <label end="10" start="7" name="PRP"/>
+                    <label end="12" start="12" name="AT0"/>
+                    <label end="18" start="14" name="NN1"/>
+                    <label end="21" start="20" name="PRF"/>
+                    <label end="28" start="23" name="NN1"/>
+                    <label end="33" start="30" name="CJT"/>
+                    <label end="36" start="35" name="PNP"/>
+                    <label end="42" start="38" name="VVB"/>
+                    <label end="47" start="44" name="NN1"/>
+                    <label end="53" start="49" name="AV0"/>
+                    <label end="55" start="55" name="PUN"/>
+                    <label end="63" start="57" name="PRP"/>
+                    <label end="65" start="65" name="AT0"/>
+                    <label end="76" start="67" name="AJ0"/>
+                    <label end="78" start="78" name="PUL"/>
+                    <label end="82" start="80" name="CJC"/>
+                    <label end="93" start="84" name="AV0"/>
+                    <label end="106" start="95" name="AJ0"/>
+                    <label end="108" start="108" name="PUR"/>
+                    <label end="118" start="110" name="AJ0"/>
+                    <label end="123" start="120" name="NN1"/>
+                    <label end="127" start="125" name="NN1-VVB"/>
+                    <label end="135" start="129" name="PRP"/>
+                    <label end="139" start="137" name="AT0"/>
+                    <label end="147" start="141" name="VVZ"/>
+                    <label end="150" start="149" name="PRF"/>
+                    <label end="155" start="152" name="NP0"/>
+                    <label end="162" start="157" name="NN1-NP0"/>
+                    <label end="164" start="164" name="PUN"/>
+                    <label end="168" start="166" name="PRP"/>
+                    <label end="175" start="170" name="NP0"/>
+                    <label end="181" start="177" name="NP0"/>
+                    <label end="183" start="183" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:41 PST Tue" status="MANUAL" ID="972899">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="285" end="36" start="35" name="Self_mover"/>
+                    <label cBy="BoC" feID="287" end="47" start="44" name="Path"/>
+                    <label cBy="MiL" feID="1977" end="53" start="49" name="Time"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="36" start="35" name="Ext"/>
+                    <label end="47" start="44" name="Dep"/>
+                    <label end="53" start="49" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="36" start="35" name="NP"/>
+                    <label end="47" start="44" name="AVP"/>
+                    <label end="53" start="49" name="AVP"/>
+                </layer>
+                <layer rank="1" name="Sent">
+                    <label end="0" start="0" name="sense1"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="42" start="38" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-700-ap">
+        <sentence sentNo="0" aPos="24554286" ID="756545">
+            <text>Looking down at their still and silent master , the two dogs began to slink nearer until they lay down beside him , noses resting on his body . </text>
+            <annotationSet cDate="01/07/2003 01:19:41 PST Tue" status="UNANN" ID="972902">
+                <layer rank="1" name="BNC">
+                    <label end="6" start="0" name="VVG"/>
+                    <label end="11" start="8" name="AVP"/>
+                    <label end="14" start="13" name="PRP"/>
+                    <label end="20" start="16" name="DPS"/>
+                    <label end="26" start="22" name="AJ0-AV0"/>
+                    <label end="30" start="28" name="CJC"/>
+                    <label end="37" start="32" name="AJ0"/>
+                    <label end="44" start="39" name="NN1"/>
+                    <label end="46" start="46" name="PUN"/>
+                    <label end="50" start="48" name="AT0"/>
+                    <label end="54" start="52" name="CRD"/>
+                    <label end="59" start="56" name="NN2"/>
+                    <label end="65" start="61" name="VVD"/>
+                    <label end="68" start="67" name="TO0"/>
+                    <label end="74" start="70" name="VVI"/>
+                    <label end="81" start="76" name="AJC"/>
+                    <label end="87" start="83" name="CJS"/>
+                    <label end="92" start="89" name="PNP"/>
+                    <label end="96" start="94" name="VVD"/>
+                    <label end="101" start="98" name="AVP"/>
+                    <label end="108" start="103" name="PRP"/>
+                    <label end="112" start="110" name="PNP"/>
+                    <label end="114" start="114" name="PUN"/>
+                    <label end="120" start="116" name="NN2"/>
+                    <label end="128" start="122" name="VVG"/>
+                    <label end="131" start="130" name="PRP"/>
+                    <label end="135" start="133" name="DPS"/>
+                    <label end="140" start="137" name="NN1"/>
+                    <label end="142" start="142" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:41 PST Tue" status="MANUAL" ID="972903">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="285" end="59" start="48" name="Self_mover"/>
+                    <label cBy="BoC" feID="1978" end="81" start="76" name="Cotheme"/>
+                    <label cBy="jLu" feID="287" itype="INI" name="Path"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="59" start="48" name="Ext"/>
+                    <label end="81" start="76" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="59" start="48" name="NP"/>
+                    <label end="81" start="76" name="NP"/>
+                </layer>
+                <layer rank="1" name="Sent">
+                    <label end="0" start="0" name="sense1"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="74" start="70" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-730-ppacross">
+        <sentence sentNo="0" aPos="1211402" ID="756546">
+            <text>The owners are not seeing guilty behaviour when Rover slinks across the floor , they are seeing the submissive behaviour Rover displays in anticipation of the aggression , however mild , the owners are about to use in attempt to reprimand him . </text>
+            <annotationSet cDate="01/07/2003 01:19:41 PST Tue" status="UNANN" ID="972904">
+                <layer rank="1" name="BNC">
+                    <label end="2" start="0" name="AT0"/>
+                    <label end="9" start="4" name="NN2"/>
+                    <label end="13" start="11" name="VBB"/>
+                    <label end="17" start="15" name="XX0"/>
+                    <label end="24" start="19" name="VVG"/>
+                    <label end="31" start="26" name="AJ0"/>
+                    <label end="41" start="33" name="NN1"/>
+                    <label end="46" start="43" name="CJS"/>
+                    <label end="52" start="48" name="NP0"/>
+                    <label end="59" start="54" name="VVZ"/>
+                    <label end="66" start="61" name="PRP"/>
+                    <label end="70" start="68" name="AT0"/>
+                    <label end="76" start="72" name="NN1"/>
+                    <label end="78" start="78" name="PUN"/>
+                    <label end="83" start="80" name="PNP"/>
+                    <label end="87" start="85" name="VBB"/>
+                    <label end="94" start="89" name="VVG"/>
+                    <label end="98" start="96" name="AT0"/>
+                    <label end="109" start="100" name="AJ0"/>
+                    <label end="119" start="111" name="NN1"/>
+                    <label end="125" start="121" name="NP0"/>
+                    <label end="134" start="127" name="VVZ"/>
+                    <label end="137" start="136" name="PRP"/>
+                    <label end="150" start="139" name="NN1"/>
+                    <label end="153" start="152" name="PRF"/>
+                    <label end="157" start="155" name="AT0"/>
+                    <label end="168" start="159" name="NN1"/>
+                    <label end="170" start="170" name="PUN"/>
+                    <label end="178" start="172" name="AV0"/>
+                    <label end="183" start="180" name="AJ0"/>
+                    <label end="185" start="185" name="PUN"/>
+                    <label end="189" start="187" name="AT0"/>
+                    <label end="196" start="191" name="NN2"/>
+                    <label end="200" start="198" name="VBB"/>
+                    <label end="206" start="202" name="AVP"/>
+                    <label end="209" start="208" name="TO0"/>
+                    <label end="213" start="211" name="VVI"/>
+                    <label end="216" start="215" name="PRP"/>
+                    <label end="224" start="218" name="NN1"/>
+                    <label end="227" start="226" name="TO0"/>
+                    <label end="237" start="229" name="VVI"/>
+                    <label end="241" start="239" name="PNP"/>
+                    <label end="243" start="243" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:42 PST Tue" status="MANUAL" ID="972905">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="287" end="76" start="61" name="Path"/>
+                    <label cBy="RLG" feID="285" end="52" start="48" name="Self_mover"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="76" start="61" name="Dep"/>
+                    <label end="52" start="48" name="Ext"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="76" start="61" name="PP"/>
+                    <label end="52" start="48" name="NP"/>
+                </layer>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="59" start="54" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-730-ppalong">
+        <sentence sentNo="0" aPos="1211298" ID="756547">
+            <text>Their assumption that ` he knows what he has done wrong &quot; is based on the fact that Rover is slinking along the floor with its head and tail down looking for all the world like a naughty school boy who 's just broken the headmaster 's window . </text>
+            <annotationSet cDate="01/07/2003 01:19:42 PST Tue" status="UNANN" ID="972906">
+                <layer rank="1" name="BNC">
+                    <label end="4" start="0" name="DPS"/>
+                    <label end="15" start="6" name="NN1"/>
+                    <label end="20" start="17" name="CJT"/>
+                    <label end="22" start="22" name="PUQ"/>
+                    <label end="25" start="24" name="PNP"/>
+                    <label end="31" start="27" name="VVZ"/>
+                    <label end="36" start="33" name="DTQ"/>
+                    <label end="39" start="38" name="PNP"/>
+                    <label end="43" start="41" name="VHZ"/>
+                    <label end="48" start="45" name="VDN"/>
+                    <label end="54" start="50" name="AV0"/>
+                    <label end="56" start="56" name="PUQ"/>
+                    <label end="59" start="58" name="VBZ"/>
+                    <label end="65" start="61" name="VVN"/>
+                    <label end="68" start="67" name="PRP"/>
+                    <label end="72" start="70" name="AT0"/>
+                    <label end="77" start="74" name="NN1"/>
+                    <label end="82" start="79" name="CJT"/>
+                    <label end="88" start="84" name="NP0"/>
+                    <label end="91" start="90" name="VBZ"/>
+                    <label end="100" start="93" name="VVG"/>
+                    <label end="106" start="102" name="PRP"/>
+                    <label end="110" start="108" name="AT0"/>
+                    <label end="116" start="112" name="NN1"/>
+                    <label end="121" start="118" name="PRP"/>
+                    <label end="125" start="123" name="DPS"/>
+                    <label end="130" start="127" name="NN1"/>
+                    <label end="134" start="132" name="CJC"/>
+                    <label end="139" start="136" name="NN1"/>
+                    <label end="144" start="141" name="AVP"/>
+                    <label end="152" start="146" name="VVG"/>
+                    <label end="156" start="154" name="PRP"/>
+                    <label end="160" start="158" name="DT0"/>
+                    <label end="164" start="162" name="AT0"/>
+                    <label end="170" start="166" name="NN1"/>
+                    <label end="175" start="172" name="PRP"/>
+                    <label end="177" start="177" name="AT0"/>
+                    <label end="185" start="179" name="AJ0"/>
+                    <label end="192" start="187" name="NN1"/>
+                    <label end="196" start="194" name="NN1"/>
+                    <label end="200" start="198" name="PNQ"/>
+                    <label end="203" start="202" name="VHZ"/>
+                    <label end="208" start="205" name="AV0"/>
+                    <label end="215" start="210" name="VVN"/>
+                    <label end="219" start="217" name="AT0"/>
+                    <label end="230" start="221" name="NN1"/>
+                    <label end="233" start="232" name="POS"/>
+                    <label end="240" start="235" name="NN1"/>
+                    <label end="242" start="242" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:42 PST Tue" status="MANUAL" ID="972907">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="285" end="88" start="84" name="Self_mover"/>
+                    <label cBy="BoC" feID="287" end="116" start="102" name="Path"/>
+                    <label cBy="MiL" feID="289" end="144" start="118" name="Manner"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="88" start="84" name="Ext"/>
+                    <label end="116" start="102" name="Dep"/>
+                    <label end="144" start="118" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="88" start="84" name="NP"/>
+                    <label end="116" start="102" name="PP"/>
+                    <label end="144" start="118" name="PP"/>
+                </layer>
+                <layer rank="1" name="Sent">
+                    <label end="0" start="0" name="sense1"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="100" start="93" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-730-ppamongst"/>
+    <subCorpus name="V-730-ppfrom">
+        <sentence sentNo="0" aPos="76753729" ID="756549">
+            <text>Watching the girl slink from the room without so much as a goodnight , Alice took hold of her husband 's hand . </text>
+            <annotationSet cDate="01/07/2003 01:19:42 PST Tue" status="UNANN" ID="972910">
+                <layer rank="1" name="BNC">
+                    <label end="7" start="0" name="VVG"/>
+                    <label end="11" start="9" name="AT0"/>
+                    <label end="16" start="13" name="NN1"/>
+                    <label end="22" start="18" name="VVI"/>
+                    <label end="27" start="24" name="PRP"/>
+                    <label end="31" start="29" name="AT0"/>
+                    <label end="36" start="33" name="NN1"/>
+                    <label end="44" start="38" name="PRP"/>
+                    <label end="47" start="46" name="AV0"/>
+                    <label end="52" start="49" name="AV0"/>
+                    <label end="55" start="54" name="AV0"/>
+                    <label end="57" start="57" name="AT0"/>
+                    <label end="67" start="59" name="NN1"/>
+                    <label end="69" start="69" name="PUN"/>
+                    <label end="75" start="71" name="NP0"/>
+                    <label end="80" start="77" name="VVD"/>
+                    <label end="85" start="82" name="NN1"/>
+                    <label end="88" start="87" name="PRF"/>
+                    <label end="92" start="90" name="DPS"/>
+                    <label end="100" start="94" name="NN1"/>
+                    <label end="103" start="102" name="POS"/>
+                    <label end="108" start="105" name="NN1"/>
+                    <label end="110" start="110" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:42 PST Tue" status="MANUAL" ID="972911">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="285" end="16" start="9" name="Self_mover"/>
+                    <label cBy="BoC" feID="286" end="36" start="24" name="Source"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="16" start="9" name="Ext"/>
+                    <label end="36" start="24" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="16" start="9" name="NP"/>
+                    <label end="36" start="24" name="PP"/>
+                </layer>
+                <layer rank="1" name="Sent">
+                    <label end="0" start="0" name="sense1"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="22" start="18" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-730-ppin"/>
+    <subCorpus name="V-730-ppinside">
+        <sentence sentNo="0" aPos="64006981" ID="756551">
+            <text>He would go very quietly now , and he would go very stealthily , and he would slink inside Tara , and he would find out quite a lot about Medoc . </text>
+            <annotationSet cDate="01/07/2003 01:19:44 PST Tue" status="UNANN" ID="972914">
+                <layer rank="1" name="BNC">
+                    <label end="1" start="0" name="PNP"/>
+                    <label end="7" start="3" name="VM0"/>
+                    <label end="10" start="9" name="VVI"/>
+                    <label end="15" start="12" name="AV0"/>
+                    <label end="23" start="17" name="AV0"/>
+                    <label end="27" start="25" name="AV0"/>
+                    <label end="29" start="29" name="PUN"/>
+                    <label end="33" start="31" name="CJC"/>
+                    <label end="36" start="35" name="PNP"/>
+                    <label end="42" start="38" name="VM0"/>
+                    <label end="45" start="44" name="VVI"/>
+                    <label end="50" start="47" name="AV0"/>
+                    <label end="61" start="52" name="AV0"/>
+                    <label end="63" start="63" name="PUN"/>
+                    <label end="67" start="65" name="CJC"/>
+                    <label end="70" start="69" name="PNP"/>
+                    <label end="76" start="72" name="VM0"/>
+                    <label end="82" start="78" name="VVI"/>
+                    <label end="89" start="84" name="PRP"/>
+                    <label end="94" start="91" name="NP0"/>
+                    <label end="96" start="96" name="PUN"/>
+                    <label end="100" start="98" name="CJC"/>
+                    <label end="103" start="102" name="PNP"/>
+                    <label end="109" start="105" name="VM0"/>
+                    <label end="114" start="111" name="VVI"/>
+                    <label end="118" start="116" name="AVP"/>
+                    <label end="124" start="120" name="AV0"/>
+                    <label end="126" start="126" name="PNI"/>
+                    <label end="130" start="128" name="PNI"/>
+                    <label end="136" start="132" name="PRP"/>
+                    <label end="142" start="138" name="NP0"/>
+                    <label end="144" start="144" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:44 PST Tue" status="MANUAL" ID="972915">
+                <layer rank="1" name="FE">
+                    <label cBy="JKR" feID="285" end="70" start="69" name="Self_mover"/>
+                    <label cBy="JKR" feID="288" end="94" start="84" name="Goal"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="70" start="69" name="Ext"/>
+                    <label end="94" start="84" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="70" start="69" name="NP"/>
+                    <label end="94" start="84" name="PP"/>
+                </layer>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Target">
+                    <label cBy="BoC" end="82" start="78" name="Target"/>
+                </layer>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="V-730-ppinto">
+        <sentence sentNo="0" aPos="74968390" ID="756552">
+            <text>Slide through the front door , slink into the bedroom -- they know the flat now , remember -- ; and use a quiet knife , with one hand across the mouth to stop a dying scream . </text>
+            <annotationSet cDate="01/07/2003 01:19:44 PST Tue" status="UNANN" ID="972916">
+                <layer rank="1" name="BNC">
+                    <label end="4" start="0" name="NN1-VVB"/>
+                    <label end="12" start="6" name="PRP"/>
+                    <label end="16" start="14" name="AT0"/>
+                    <label end="22" start="18" name="AJ0"/>
+                    <label end="27" start="24" name="NN1"/>
+                    <label end="29" start="29" name="PUN"/>
+                    <label end="35" start="31" name="NN1-VVB"/>
+                    <label end="40" start="37" name="PRP"/>
+                    <label end="44" start="42" name="AT0"/>
+                    <label end="52" start="46" name="NN1"/>
+                    <label end="55" start="54" name="PUN"/>
+                    <label end="60" start="57" name="PNP"/>
+                    <label end="65" start="62" name="VVB"/>
+                    <label end="69" start="67" name="AT0"/>
+                    <label end="74" start="71" name="AJ0-NN1"/>
+                    <label end="78" start="76" name="AV0"/>
+                    <label end="80" start="80" name="PUN"/>
+                    <label end="89" start="82" name="VVB"/>
+                    <label end="92" start="91" name="PUN"/>
+                    <label end="94" start="94" name="PUN"/>
+                    <label end="98" start="96" name="CJC"/>
+                    <label end="102" start="100" name="VVB"/>
+                    <label end="104" start="104" name="AT0"/>
+                    <label end="110" start="106" name="AJ0"/>
+                    <label end="116" start="112" name="NN1"/>
+                    <label end="118" start="118" name="PUN"/>
+                    <label end="123" start="120" name="PRP"/>
+                    <label end="127" start="125" name="CRD"/>
+                    <label end="132" start="129" name="NN1"/>
+                    <label end="139" start="134" name="PRP"/>
+                    <label end="143" start="141" name="AT0"/>
+                    <label end="149" start="145" name="NN1"/>
+                    <label end="152" start="151" name="TO0"/>
+                    <label end="157" start="154" name="VVI"/>
+                    <label end="159" start="159" name="AT0"/>
+                    <label end="165" start="161" name="AJ0"/>
+                    <label end="172" start="167" name="NN1"/>
+                    <label end="174" start="174" name="PUN"/>
+                </layer>
+                <layer rank="1" name="NER"/>
+                <layer rank="1" name="WSL"/>
+            </annotationSet>
+            <annotationSet cDate="01/07/2003 01:19:44 PST Tue" status="MANUAL" ID="972917">
+                <layer rank="1" name="FE">
+                    <label cBy="BoC" feID="288" end="52" start="37" name="Goal"/>
+                    <label cBy="BoC" feID="285" itype="CNI" name="Self_mover"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="52" start="37" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="52" start="37" name="PP"/>
+                </layer>
+                <layer rank="1" name="Sent">
+                    <label end="0" start="0" name="sense1"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+    

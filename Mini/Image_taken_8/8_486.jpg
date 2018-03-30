@@ -1,0 +1,858 @@
+"""
+INLINE PATTERNS
+=============================================================================
+
+Inline patterns such as *emphasis* are handled by means of auxiliary
+objects, one per pattern.  Pattern objects must be instances of classes
+that extend markdown.Pattern.  Each pattern object uses a single regular
+expression and needs support the following methods:
+
+    pattern.getCompiledRegExp() # returns a regular expression
+
+    pattern.handleMatch(m) # takes a match object and returns
+                           # an ElementTree element or just plain text
+
+All of python markdown's built-in patterns subclass from Pattern,
+but you can add additional patterns that don't.
+
+Also note that all the regular expressions used by inline must
+capture the whole block.  For this reason, they all start with
+'^(.*)' and end with '(.*)!'.  In case with built-in expression
+Pattern takes care of adding the "^(.*)" and "(.*)!".
+
+Finally, the order in which regular expressions are applied is very
+important - e.g. if we first replace http://.../ links with <a> tags
+and _then_ try to replace inline html, we would end up with a mess.
+So, we apply the expressions in the following order:
+
+* escape and backticks have to go before everything else, so
+  that we can preempt any markdown patterns by escaping them.
+
+* then we handle auto-links (must be done before inline html)
+
+* then we handle inline HTML.  At this point we will simply
+  replace all inline HTML strings with a placeholder and add
+  the actual HTML to a hash.
+
+* then inline images (must be done before links)
+
+* then bracketed links, first regular then reference-style
+
+* finally we apply strong and emphasis
+"""
+
+from __future__ import absolute_import
+from __future__ import unicode_literals
+from . import util
+from . import odict
+import re
+try:  # pragma: no cover
+    from urllib.parse import urlparse, urlunparse
+except ImportError:  # pragma: no cover
+    from urlparse import urlparse, urlunparse
+try:  # pragma: no cover
+    from html import entities
+except ImportError:  # pragma: no cover
+    import htmlentitydefs as entities
+
+
+def build_inlinepatterns(md_instance, **kwargs):
+    """ Build the default set of inline patterns for Markdown. """
+    inlinePatterns = odict.OrderedDict()
+    inlinePatterns["backtick"] = BacktickPattern(BACKTICK_RE)
+    inlinePatterns["escape"] = EscapePattern(ESCAPE_RE, md_instance)
+    inlinePatterns["reference"] = ReferencePattern(REFERENCE_RE, md_instance)
+    inlinePatterns["link"] = LinkPattern(LINK_RE, md_instance)
+    inlinePatterns["image_link"] = ImagePattern(IMAGE_LINK_RE, md_instance)
+    inlinePatterns["image_reference"] = ImageReferencePattern(
+        IMAGE_REFERENCE_RE, md_instance
+    )
+    inlinePatterns["short_reference"] = ReferencePattern(
+        SHORT_REF_RE, md_instance
+    )
+    inlinePatterns["autolink"] = AutolinkPattern(AUTOLINK_RE, md_instance)
+    inlinePatterns["automail"] = AutomailPattern(AUTOMAIL_RE, md_instance)
+    inlinePatterns["linebreak"] = SubstituteTagPattern(LINE_BREAK_RE, 'br')
+    if md_instance.safeMode != 'escape':
+        inlinePatterns["html"] = HtmlPattern(HTML_RE, md_instance)
+    inlinePatterns["entity"] = HtmlPattern(ENTITY_RE, md_instance)
+    inlinePatterns["not_strong"] = SimpleTextPattern(NOT_STRONG_RE)
+    inlinePatterns["em_strong"] = DoubleTagPattern(EM_STRONG_RE, 'strong,em')
+    inlinePatterns["strong_em"] = DoubleTagPattern(STRONG_EM_RE, 'em,strong')
+    inlinePatterns["strong"] = SimpleTagPattern(STRONG_RE, 'strong')
+    inlinePatterns["emphasis"] = SimpleTagPattern(EMPHASIS_RE, 'em')
+    if md_instance.smart_emphasis:
+        inlinePatterns["emphasis2"] = SimpleTagPattern(SMART_EMPHASIS_RE, 'em')
+    else:
+        inlinePatterns["emphasis2"] = SimpleTagPattern(EMPHASIS_2_RE, 'em')
+    return inlinePatterns
+
+
+"""
+The actual regular expressions for patterns
+-----------------------------------------------------------------------------
+"""
+
+NOBRACKET = r'[^\]\[]*'
+BRK = (
+    r'\[(' +
+    (NOBRACKET + r'(\[')*6 +
+    (NOBRACKET + r'\])*')*6 +
+    NOBRACKET + r')\]'
+)
+NOIMG = r'(?<!\!)'
+
+# `e=f()` or ``e=f("`")``
+BACKTICK_RE = r'(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)(`+)(.+?)(?<!`)\3(?!`))'
+
+# \<
+ESCAPE_RE = r'\\(.)'
+
+# *emphasis*
+EMPHASIS_RE = r'(\*)([^\*]+)\2'
+
+# **strong**
+STRONG_RE = r'(\*{2}|_{2})(.+?)\2'
+
+# ***strongem*** or ***em*strong**
+EM_STRONG_RE = r'(\*|_)\2{2}(.+?)\2(.*?)\2{2}'
+
+# ***strong**em*
+STRONG_EM_RE = r'(\*|_)\2{2}(.+?)\2{2}(.*?)\2'
+
+# _smart_emphasis_
+SMART_EMPHASIS_RE = r'(?<!\w)(_)(?!_)(.+?)(?<!_)\2(?!\w)'
+
+# _emphasis_
+EMPHASIS_2_RE = r'(_)(.+?)\2'
+
+# [text](url) or [text](<url>) or [text](url "title")
+LINK_RE = NOIMG + BRK + \
+    r'''\(\s*(<.*?>|((?:(?:\(.*?\))|[^\(\)]))*?)\s*((['"])(.*?)\12\s*)?\)'''
+
+# ![alttxt](http://x.com/) or ![alttxt](<http://x.com/>)
+IMAGE_LINK_RE = r'\!' + BRK + r'\s*\(\s*(<.*?>|([^"\)\s]+\s*"[^"]*"|[^\)\s]*))\s*\)'
+
+# [Google][3]
+REFERENCE_RE = NOIMG + BRK + r'\s?\[([^\]]*)\]'
+
+# [Google]
+SHORT_REF_RE = NOIMG + r'\[([^\]]+)\]'
+
+# ![alt text][2]
+IMAGE_REFERENCE_RE = r'\!' + BRK + '\s?\[([^\]]*)\]'
+
+# stand-alone * or _
+NOT_STRONG_RE = r'((^| )(\*|_)( |$))'
+
+# <http://www.123.com>
+AUTOLINK_RE = r'<((?:[Ff]|[Hh][Tt])[Tt][Pp][Ss]?://[^>]*)>'
+
+# <me@example.com>
+AUTOMAIL_RE = r'<([^> \!]*@[^> ]*)>'
+
+# <...>
+HTML_RE = r'(\<([a-zA-Z/][^\>]*?|\!--.*?--)\>)'
+
+# &amp;
+ENTITY_RE = r'(&[\#a-zA-Z0-9]*;)'
+
+# two spaces at end of line
+LINE_BREAK_RE = r'  \n'
+
+
+def dequote(string):
+    """Remove quotes from around a string."""
+    if ((string.startswith('"') and string.endswith('"')) or
+       (string.startswith("'") and string.endswith("'"))):
+        return string[1:-1]
+    else:
+        return string
+
+
+ATTR_RE = re.compile("\{@([^\}]*)=([^\}]*)}")  # {@id=123}
+
+
+def handleAttributes(text, parent):
+    """Set values of an element based on attribute definitions ({@id=123})."""
+    def attributeCallback(match):
+        parent.set(match.group(1), match.group(2).replace('\n', ' '))
+    return ATTR_RE.sub(attributeCallback, text)
+
+
+"""
+The pattern classes
+-----------------------------------------------------------------------------
+"""
+
+
+class Pattern(object):
+    """Base class that inline patterns subclass. """
+
+    def __init__(self, pattern, markdown_instance=None):
+        """
+        Create an instant of an inline pattern.
+
+        Keyword arguments:
+
+        * pattern: A regular expression that matches a pattern
+
+        """
+        self.pattern = pattern
+        self.compiled_re = re.compile("^(.*?)%s(.*)$" % pattern,
+                                      re.DOTALL | re.UNICODE)
+
+        # Api for Markdown to pass safe_mode into instance
+        self.safe_mode = False
+        if markdown_instance:
+            self.markdown = markdown_instance
+
+    def getCompiledRegExp(self):
+        """ Return a compiled regular expression. """
+        return self.compiled_re
+
+    def handleMatch(self, m):
+        """Return a ElementTree element from the given match.
+
+        Subclasses should override this method.
+
+        Keyword arguments:
+
+        * m: A re match object containing a match of the pattern.
+
+        """
+        pass  # pragma: no cover
+
+    def type(self):
+        """ Return class name, to define pattern type """
+        return self.__class__.__name__
+
+    def unescape(self, text):
+        """ Return unescaped text given text with an inline placeholder. """
+        try:
+            stash = self.markdown.treeprocessors['inline'].stashed_nodes
+        except KeyError:  # pragma: no cover
+            return text
+
+        def itertext(el):  # pragma: no cover
+            ' Reimplement Element.itertext for older python versions '
+            tag = el.tag
+            if not isinstance(tag, util.string_type) and tag is not None:
+                return
+            if el.text:
+                yield el.text
+            for e in el:
+                for s in itertext(e):
+                    yield s
+                if e.tail:
+                    yield e.tail
+
+        def get_stash(m):
+            id = m.group(1)
+            if id in stash:
+                value = stash.get(id)
+                if isinstance(value, util.string_type):
+                    return value
+                else:
+                    # An etree Element - return text content only
+                    return ''.join(itertext(value))
+        return util.INLINE_PLACEHOLDER_RE.sub(get_stash, text)
+
+
+class SimpleTextPattern(Pattern):
+    """ Return a simple text of group(2) of a Pattern. """
+    def handleMatch(self, m):
+        return m.group(2)
+
+
+class EscapePattern(Pattern):
+    """ Return an escaped character. """
+
+    def handleMatch(self, m):
+        char = m.group(2)
+        if char in self.markdown.ESCAPED_CHARS:
+            return '%s%s%s' % (util.STX, ord(char), util.ETX)
+        else:
+            return None
+
+
+class SimpleTagPattern(Pattern):
+    """
+    Return element of type `tag` with a text attribute of group(3)
+    of a Pattern.
+
+    """
+    def __init__(self, pattern, tag):
+        Pattern.__init__(self, pattern)
+        self.tag = tag
+
+    def handleMatch(self, m):
+        el = util.etree.Element(self.tag)
+        el.text = m.group(3)
+        return el
+
+
+class SubstituteTagPattern(SimpleTagPattern):
+    """ Return an element of type `tag` with no children. """
+    def handleMatch(self, m):
+        return util.etree.Element(self.tag)
+
+
+class BacktickPattern(Pattern):
+    """ Return a `<code>` element containing the matching text. """
+    def __init__(self, pattern):
+        Pattern.__init__(self, pattern)
+        self.ESCAPED_BSLASH = '%s%s%s' % (util.STX, ord('\\'), util.ETX)
+        self.tag = 'code'
+
+    def handleMatch(self, m):
+        if m.group(4):
+            el = util.etree.Element(self.tag)
+            el.text = util.AtomicString(m.group(4).strip())
+            return el
+        else:
+            return m.group(2).replace('\\\\', self.ESCAPED_BSLASH)
+
+
+class DoubleTagPattern(SimpleTagPattern):
+    """Return a ElementTree element nested in tag2 nested in tag1.
+
+    Useful for strong emphasis etc.
+
+    """
+    def handleMatch(self, m):
+        tag1, tag2 = self.tag.split(",")
+        el1 = util.etree.Element(tag1)
+        el2 = util.etree.SubElement(el1, tag2)
+        el2.text = m.group(3)
+        if len(m.groups()) == 5:
+            el2.tail = m.group(4)
+        return el1
+
+
+class HtmlPattern(Pattern):
+    """ Store raw inline html and return a placeholder. """
+    def handleMatch(self, m):
+        rawhtml = self.unescape(m.group(2))
+        place_holder = self.markdown.htmlStash.store(rawhtml)
+        return place_holder
+
+    def unescape(self, text):
+        """ Return unescaped text given text with an inline placeholder. """
+        try:
+            stash = self.markdown.treeprocessors['inline'].stashed_nodes
+        except KeyError:  # pragma: no cover
+            return text
+
+        def get_stash(m):
+            id = m.group(1)
+            value = stash.get(id)
+            if value is not None:
+                try:
+                    return self.markdown.serializer(value)
+                except:
+                    return '\%s' % value
+
+        return util.INLINE_PLACEHOLDER_RE.sub(get_stash, text)
+
+
+class LinkPattern(Pattern):
+    """ Return a link element from the given match. """
+    def handleMatch(self, m):
+        el = util.etree.Element("a")
+        el.text = m.group(2)
+        title = m.group(13)
+        href = m.group(9)
+
+        if href:
+            if href[0] == "<":
+                href = href[1:-1]
+            el.set("href", self.sanitize_url(self.unescape(href.strip())))
+        else:
+            el.set("href", "")
+
+        if title:
+            title = dequote(self.unescape(title))
+            el.set("title", title)
+        return el
+
+    def sanitize_url(self, url):
+        """
+        Sanitize a url against xss attacks in "safe_mode".
+
+        Rather than specifically blacklisting `javascript:alert("XSS")` and all
+        its aliases (see <http://ha.ckers.org/xss.html>), we whitelist known
+        safe url formats. Most urls contain a network location, however some
+        are known not to (i.e.: mailto links). Script urls do not contain a
+        location. Additionally, for `javascript:...`, the scheme would be
+        "javascript" but some aliases will appear to `urlparse()` to have no
+        scheme. On top of that relative links (i.e.: "foo/bar.html") have no
+        scheme. Therefore we must check "path", "parameters", "query" and
+        "fragment" for any literal colons. We don't check "scheme" for colons
+        because it *should* never have any and "netloc" must allow the form:
+        `username:password@host:port`.
+
+        """
+        if not self.markdown.safeMode:
+            # Return immediately bipassing parsing.
+            return url
+
+        try:
+            scheme, netloc, path, params, query, fragment = url = urlparse(url)
+        except ValueError:  # pragma: no cover
+            # Bad url - so bad it couldn't be parsed.
+            return ''
+
+        locless_schemes = ['', 'mailto', 'news']
+        allowed_schemes = locless_schemes + ['http', 'https', 'ftp', 'ftps']
+        if scheme not in allowed_schemes:
+            # Not a known (allowed) scheme. Not safe.
+            return ''
+
+        if netloc == '' and scheme not in locless_schemes:  # pragma: no cover
+            # This should not happen. Treat as suspect.
+            return ''
+
+        for part in url[2:]:
+            if ":" in part:
+                # A colon in "path", "parameters", "query"
+                # or "fragment" is suspect.
+                return ''
+
+        # Url passes all tests. Return url as-is.
+        return urlunparse(url)
+
+
+class ImagePattern(LinkPattern):
+    """ Return a img element from the given match. """
+    def handleMatch(self, m):
+        el = util.etree.Element("img")
+        src_parts = m.group(9).split()
+        if src_parts:
+            src = src_parts[0]
+            if src[0] == "<" and src[-1] == ">":
+                src = src[1:-1]
+            el.set('src', self.sanitize_url(self.unescape(src)))
+        else:
+            el.set('src', "")
+        if len(src_parts) > 1:
+            el.set('title', dequote(self.unescape(" ".join(src_parts[1:]))))
+
+        if self.markdown.enable_attributes:
+            truealt = handleAttributes(m.group(2), el)
+        else:
+            truealt = m.group(2)
+
+        el.set('alt', self.unescape(truealt))
+        return el
+
+
+class ReferencePattern(LinkPattern):
+    """ Match to a stored reference and return link element. """
+
+    NEWLINE_CLEANUP_RE = re.compile(r'[ ]?\n', re.MULTILINE)
+
+    def handleMatch(self, m):
+        try:
+            id = m.group(9).lower()
+        except IndexError:
+            id = None
+        if not id:
+            # if we got something like "[Google][]" or "[Goggle]"
+            # we'll use "google" as the id
+            id = m.group(2).lower()
+
+        # Clean up linebreaks in id
+        id = self.NEWLINE_CLEANUP_RE.sub(' ', id)
+        if id not in self.markdown.references:  # ignore undefined refs
+            return None
+        href, title = self.markdown.references[id]
+
+        text = m.group(2)
+        return self.makeTag(href, title, text)
+
+    def makeTag(self, href, title, text):
+        el = util.etree.Element('a')
+
+        el.set('href', self.sanitize_url(href))
+        if title:
+            el.set('title', title)
+
+        el.text = text
+        return el
+
+
+class ImageReferencePattern(ReferencePattern):
+    """ Match to a stored reference and return img element. """
+    def makeTag(self, href, title, text):
+        el = util.etree.Element("img")
+        el.set("src", self.sanitize_url(href))
+        if title:
+            el.set("title", title)
+
+        if self.markdown.enable_attributes:
+            text = handleAttributes(text, el)
+
+        el.set("alt", self.unescape(text))
+        return el
+
+
+class AutolinkPattern(Pattern):
+    """ Return a link Element given an autolink (`<http://example/com>`). """
+    def handleMatch(self, m):
+        el = util.etree.Element("a")
+        el.set('href', self.unescape(m.group(2)))
+        el.text = util.AtomicString(m.group(2))
+        return el
+
+
+class AutomailPattern(Pattern):
+    """
+    Return a mailto link Element given an automail link (`<foo@example.com>`).
+    """
+    def handleMatch(self, m):
+        el = util.etree.Element('a')
+        email = self.unescape(m.group(2))
+        if email.startswith("mailto:"):
+            email = email[len("mailto:"):]
+
+        def codepoint2name(code):
+            """Return entity definition by code, or the code if not defined."""
+            entity = entities.codepoint2name.get(code)
+            if entity:
+                return "%s%s;" % (util.AMP_SUBSTITUTE, entity)
+            else:
+                return "%s#%d;" % (util.AMP_SUBSTITUTE, code)
+
+        letters = [codepoint2name(ord(letter)) for letter in email]
+        el.text = util.AtomicString(''.join(letters))
+
+        mailto = "mailto:" + email
+        mailto = "".join([util.AMP_SUBSTITUTE + '#%d;' %
+                          ord(letter) for letter in mailto])
+        el.set('href', mailto)
+        return el
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="Created" POS="N" name="methane.n" ID="11605" frame="Substance" frameID="1321" totalAnnotated="0" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="9F79EE" type="Peripheral" abbrev="con" name="Constituents"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Extra-Thematic" abbrev="des" name="Descriptor"/>
+            <FE fgColor="FFFFFF" bgColor="FF0000" type="Extra-Thematic" abbrev="Inh" name="Inherent_purpose"/>
+            <FE fgColor="FFFFFF" bgColor="008000" type="Extra-Thematic" abbrev="sou" name="Origin"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="sub" name="Substance"/>
+            <FE fgColor="FFFFFF" bgColor="FF69B4" type="Peripheral" abbrev="typ" name="Type"/>
+        </frame>
+    </header>
+    <definition>COD: a colourless, odourless flammable gas which is the main constituent of natural gas and the simplest member of the alkane series</definition>
+    <lexeme POS="N" name="methane"/>
+    <valences/>
+</lexUnit>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="Needs_SCs" POS="V" name="by-pass.v" ID="16823" frame="Compliance" frameID="117" totalAnnotated="3" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="800080" type="Core" abbrev="Act" name="Act"/>
+            <FE fgColor="FFFFFF" bgColor="FF69B4" type="Peripheral" abbrev="Degr" name="Degree"/>
+            <FE fgColor="FFFFFF" bgColor="9400D3" type="Extra-Thematic" abbrev="Depict" name="Depictive"/>
+            <FE fgColor="FFFFFF" bgColor="90876C" type="Extra-Thematic" abbrev="exp" name="Explanation"/>
+            <FE fgColor="000000" bgColor="7FFF00" type="Peripheral" abbrev="" name="Judge"/>
+            <FE fgColor="FFFFFF" bgColor="FF00FF" type="Peripheral" abbrev="Manr" name="Manner"/>
+            <FE fgColor="FFFFFF" bgColor="A52A2A" type="Peripheral" abbrev="Mns" name="Means"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="Norm" name="Norm"/>
+            <FE fgColor="FFFFFF" bgColor="FF0000" type="Core" abbrev="Prot" name="Protagonist"/>
+            <FE fgColor="FFFFFF" bgColor="808080" type="Extra-Thematic" abbrev="Result" name="Result"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Core" abbrev="soa" name="State_of_affairs"/>
+            <FE fgColor="FFFFFF" bgColor="008000" type="Peripheral" abbrev="Time" name="Time"/>
+        </frame>
+    </header>
+    <definition>FN: avoid or circumvent rules to accomplish a goal.</definition>
+    <lexeme POS="V" name="by-pass"/>
+    <valences>
+        <FERealization total="1">
+            <FE name="Act"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Act"/>
+                <annoSet ID="6629588"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Manner"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <annoSet ID="6629604"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Norm"/>
+            <pattern total="1">
+                <valenceUnit GF="Ext" PT="NP" FE="Norm"/>
+                <annoSet ID="6629604"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="3">
+            <FE name="Protagonist"/>
+            <pattern total="2">
+                <valenceUnit GF="Ext" PT="NP" FE="Protagonist"/>
+                <annoSet ID="6629586"/>
+                <annoSet ID="6629588"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="" PT="CNI" FE="Protagonist"/>
+                <annoSet ID="6629604"/>
+            </pattern>
+        </FERealization>
+        <FEGroupRealization total="1">
+            <FE name="Act"/>
+            <FE name="Protagonist"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Act"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Protagonist"/>
+                <annoSet ID="6629588"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Manner"/>
+            <FE name="Norm"/>
+            <FE name="Protagonist"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Manner"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Norm"/>
+                <valenceUnit GF="" PT="CNI" FE="Protagonist"/>
+                <annoSet ID="6629604"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Protagonist"/>
+            <pattern total="1">
+                <valenceUnit GF="Ext" PT="NP" FE="Protagonist"/>
+                <annoSet ID="6629586"/>
+            </pattern>
+        </FEGroupRealization>
+    </valences>
+    <subCorpus name="01-T-NP-(1)">
+        <sentence sentNo="0" aPos="70315" ID="4141150">
+            <text>He invoked a new law Monday allowing him to bypass the Pentagon acquisition process .</text>
+            <annotationSet cDate="05/29/2012 12:04:39 PDT Tue" status="UNANN" ID="6629585">
+                <layer rank="1" name="PENN">
+                    <label end="1" start="0" name="PP"/>
+                    <label end="9" start="3" name="VVD"/>
+                    <label end="11" start="11" name="dt"/>
+                    <label end="15" start="13" name="jj"/>
+                    <label end="19" start="17" name="nn"/>
+                    <label end="26" start="21" name="NP"/>
+                    <label end="35" start="28" name="VVG"/>
+                    <label end="39" start="37" name="PP"/>
+                    <label end="42" start="41" name="to"/>
+                    <label end="49" start="44" name="VV"/>
+                    <label end="53" start="51" name="dt"/>
+                    <label end="62" start="55" name="NP"/>
+                    <label end="74" start="64" name="nn"/>
+                    <label end="82" start="76" name="nn"/>
+                    <label end="84" start="84" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="26" start="21" name="date"/>
+                    <label end="62" start="55" name="organization"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="1" start="0" name="NT"/>
+                    <label end="11" start="11" name="NT"/>
+                    <label end="26" start="21" name="NT"/>
+                    <label end="39" start="37" name="NT"/>
+                    <label end="42" start="41" name="NT"/>
+                    <label end="53" start="51" name="NT"/>
+                    <label end="62" start="55" name="NT"/>
+                    <label end="84" start="84" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="05/29/2012 12:04:39 PDT Tue" status="MANUAL" ID="6629586">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="49" start="44" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="612" end="39" start="37" name="Protagonist"/>
+                    <label cBy="RLG" feID="640" end="82" start="51" name="Norm"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="39" start="37" name="Ext"/>
+                    <label end="82" start="51" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="39" start="37" name="NP"/>
+                    <label end="82" start="51" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+        <sentence sentNo="0" aPos="1211205" ID="4141151">
+            <text>Muslim human rights activists and Mbugua Mureithi , a lawyer for three of the suspects , who were sent to Uganda in late July , accused the police of bypassing normal procedures in the transfer .</text>
+            <annotationSet cDate="05/29/2012 12:04:39 PDT Tue" status="UNANN" ID="6629587">
+                <layer rank="1" name="PENN">
+                    <label end="5" start="0" name="jj"/>
+                    <label end="11" start="7" name="jj"/>
+                    <label end="18" start="13" name="nns"/>
+                    <label end="28" start="20" name="nns"/>
+                    <label end="32" start="30" name="cc"/>
+                    <label end="39" start="34" name="NP"/>
+                    <label end="48" start="41" name="NP"/>
+                    <label end="50" start="50" name=","/>
+                    <label end="52" start="52" name="dt"/>
+                    <label end="59" start="54" name="nn"/>
+                    <label end="63" start="61" name="in"/>
+                    <label end="69" start="65" name="cd"/>
+                    <label end="72" start="71" name="in"/>
+                    <label end="76" start="74" name="dt"/>
+                    <label end="85" start="78" name="nns"/>
+                    <label end="87" start="87" name=","/>
+                    <label end="91" start="89" name="wp"/>
+                    <label end="96" start="93" name="VBD"/>
+                    <label end="101" start="98" name="VVN"/>
+                    <label end="104" start="103" name="to"/>
+                    <label end="111" start="106" name="NP"/>
+                    <label end="114" start="113" name="in"/>
+                    <label end="119" start="116" name="jj"/>
+                    <label end="124" start="121" name="NP"/>
+                    <label end="126" start="126" name=","/>
+                    <label end="134" start="128" name="VVD"/>
+                    <label end="138" start="136" name="dt"/>
+                    <label end="145" start="140" name="nn"/>
+                    <label end="148" start="147" name="in"/>
+                    <label end="158" start="150" name="VVG"/>
+                    <label end="165" start="160" name="jj"/>
+                    <label end="176" start="167" name="nns"/>
+                    <label end="179" start="178" name="in"/>
+                    <label end="183" start="181" name="dt"/>
+                    <label end="192" start="185" name="nn"/>
+                    <label end="194" start="194" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="48" start="34" name="person"/>
+                    <label end="111" start="106" name="location"/>
+                    <label end="124" start="121" name="date"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="32" start="30" name="NT"/>
+                    <label end="39" start="34" name="NT"/>
+                    <label end="48" start="41" name="NT"/>
+                    <label end="50" start="50" name="NT"/>
+                    <label end="52" start="52" name="NT"/>
+                    <label end="63" start="61" name="NT"/>
+                    <label end="69" start="65" name="NT"/>
+                    <label end="72" start="71" name="NT"/>
+                    <label end="76" start="74" name="NT"/>
+                    <label end="87" start="87" name="NT"/>
+                    <label end="91" start="89" name="NT"/>
+                    <label end="96" start="93" name="NT"/>
+                    <label end="104" start="103" name="NT"/>
+                    <label end="111" start="106" name="NT"/>
+                    <label end="114" start="113" name="NT"/>
+                    <label end="124" start="121" name="NT"/>
+                    <label end="126" start="126" name="NT"/>
+                    <label end="138" start="136" name="NT"/>
+                    <label end="148" start="147" name="NT"/>
+                    <label end="179" start="178" name="NT"/>
+                    <label end="183" start="181" name="NT"/>
+                    <label end="194" start="194" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="05/29/2012 12:04:39 PDT Tue" status="MANUAL" ID="6629588">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="158" start="150" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="612" end="145" start="136" name="Protagonist"/>
+                    <label cBy="RLG" feID="640" end="176" start="160" name="Norm"/>
+                    <label cBy="RLG" feID="613" end="192" start="178" name="Act"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="145" start="136" name="Ext"/>
+                    <label end="176" start="160" name="Dep"/>
+                    <label end="192" start="178" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="145" start="136" name="NP"/>
+                    <label end="176" start="160" name="PP"/>
+                    <label end="192" start="178" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+    <subCorpus name="other-matched-(1)"/>
+    <subCorpus name="other-unmatched-(1)">
+        <sentence sentNo="0" aPos="198256" ID="4141159">
+            <text>First , several brokers interviewed in Katmandu said that existing laws could be bypassed easily , thanks to corruption in the government .</text>
+            <annotationSet cDate="05/29/2012 12:04:39 PDT Tue" status="UNANN" ID="6629603">
+                <layer rank="1" name="PENN">
+                    <label end="4" start="0" name="rb"/>
+                    <label end="6" start="6" name=","/>
+                    <label end="14" start="8" name="jj"/>
+                    <label end="22" start="16" name="nns"/>
+                    <label end="34" start="24" name="VVN"/>
+                    <label end="37" start="36" name="in"/>
+                    <label end="46" start="39" name="NP"/>
+                    <label end="51" start="48" name="VVD"/>
+                    <label end="56" start="53" name="IN/that"/>
+                    <label end="65" start="58" name="jj"/>
+                    <label end="70" start="67" name="nns"/>
+                    <label end="76" start="72" name="md"/>
+                    <label end="79" start="78" name="vb"/>
+                    <label end="88" start="81" name="VVN"/>
+                    <label end="95" start="90" name="rb"/>
+                    <label end="97" start="97" name=","/>
+                    <label end="104" start="99" name="nns"/>
+                    <label end="107" start="106" name="to"/>
+                    <label end="118" start="109" name="nn"/>
+                    <label end="121" start="120" name="in"/>
+                    <label end="125" start="123" name="dt"/>
+                    <label end="136" start="127" name="nn"/>
+                    <label end="138" start="138" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="46" start="39" name="location"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="4" start="0" name="NT"/>
+                    <label end="6" start="6" name="NT"/>
+                    <label end="37" start="36" name="NT"/>
+                    <label end="46" start="39" name="NT"/>
+                    <label end="76" start="72" name="NT"/>
+                    <label end="79" start="78" name="NT"/>
+                    <label end="95" start="90" name="NT"/>
+                    <label end="97" start="97" name="NT"/>
+                    <label end="107" start="106" name="NT"/>
+                    <label end="121" start="120" name="NT"/>
+                    <label end="125" start="123" name="NT"/>
+                    <label end="138" start="138" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="05/29/2012 12:04:40 PDT Tue" status="MANUAL" ID="6629604">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="88" start="81" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="640" end="70" start="58" name="Norm"/>
+                    <label cBy="RLG" feID="1117" end="95" start="90" name="Manner"/>
+                    <label cBy="RLG" feID="612" itype="CNI" name="Protagonist"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="70" start="58" name="Ext"/>
+                    <label end="95" start="90" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="70" start="58" name="NP"/>
+                    <label end="95" start="90" name="AVP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Verb"/>
+            </annotationSet>
+        </sentence>
+    </subCorpus>
+</lexUnit>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  

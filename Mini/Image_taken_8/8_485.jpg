@@ -1,0 +1,791 @@
+"""
+PRE-PROCESSORS
+=============================================================================
+
+Preprocessors work on source text before we start doing anything too
+complicated.
+"""
+
+from __future__ import absolute_import
+from __future__ import unicode_literals
+from . import util
+from . import odict
+import re
+
+
+def build_preprocessors(md_instance, **kwargs):
+    """ Build the default set of preprocessors used by Markdown. """
+    preprocessors = odict.OrderedDict()
+    preprocessors['normalize_whitespace'] = NormalizeWhitespace(md_instance)
+    if md_instance.safeMode != 'escape':
+        preprocessors["html_block"] = HtmlBlockPreprocessor(md_instance)
+    preprocessors["reference"] = ReferencePreprocessor(md_instance)
+    return preprocessors
+
+
+class Preprocessor(util.Processor):
+    """
+    Preprocessors are run after the text is broken into lines.
+
+    Each preprocessor implements a "run" method that takes a pointer to a
+    list of lines of the document, modifies it as necessary and returns
+    either the same pointer or a pointer to a new list.
+
+    Preprocessors must extend markdown.Preprocessor.
+
+    """
+    def run(self, lines):
+        """
+        Each subclass of Preprocessor should override the `run` method, which
+        takes the document as a list of strings split by newlines and returns
+        the (possibly modified) list of lines.
+
+        """
+        pass  # pragma: no cover
+
+
+class NormalizeWhitespace(Preprocessor):
+    """ Normalize whitespace for consistant parsing. """
+
+    def run(self, lines):
+        source = '\n'.join(lines)
+        source = source.replace(util.STX, "").replace(util.ETX, "")
+        source = source.replace("\r\n", "\n").replace("\r", "\n") + "\n\n"
+        source = source.expandtabs(self.markdown.tab_length)
+        source = re.sub(r'(?<=\n) +\n', '\n', source)
+        return source.split('\n')
+
+
+class HtmlBlockPreprocessor(Preprocessor):
+    """Remove html blocks from the text and store them for later retrieval."""
+
+    right_tag_patterns = ["</%s>", "%s>"]
+    attrs_pattern = r"""
+        \s+(?P<attr>[^>"'/= ]+)=(?P<q>['"])(?P<value>.*?)(?P=q) # attr="value"
+        |                                                       # OR
+        \s+(?P<attr1>[^>"'/= ]+)=(?P<value1>[^> ]+)             # attr=value
+        |                                                       # OR
+        \s+(?P<attr2>[^>"'/= ]+)                                # attr
+        """
+    left_tag_pattern = r'^\<(?P<tag>[^> ]+)(?P<attrs>(%s)*)\s*\/?\>?' % \
+                       attrs_pattern
+    attrs_re = re.compile(attrs_pattern, re.VERBOSE)
+    left_tag_re = re.compile(left_tag_pattern, re.VERBOSE)
+    markdown_in_raw = False
+
+    def _get_left_tag(self, block):
+        m = self.left_tag_re.match(block)
+        if m:
+            tag = m.group('tag')
+            raw_attrs = m.group('attrs')
+            attrs = {}
+            if raw_attrs:
+                for ma in self.attrs_re.finditer(raw_attrs):
+                    if ma.group('attr'):
+                        if ma.group('value'):
+                            attrs[ma.group('attr').strip()] = ma.group('value')
+                        else:
+                            attrs[ma.group('attr').strip()] = ""
+                    elif ma.group('attr1'):
+                        if ma.group('value1'):
+                            attrs[ma.group('attr1').strip()] = ma.group(
+                                'value1'
+                            )
+                        else:
+                            attrs[ma.group('attr1').strip()] = ""
+                    elif ma.group('attr2'):
+                        attrs[ma.group('attr2').strip()] = ""
+            return tag, len(m.group(0)), attrs
+        else:
+            tag = block[1:].split(">", 1)[0].lower()
+            return tag, len(tag)+2, {}
+
+    def _recursive_tagfind(self, ltag, rtag, start_index, block):
+        while 1:
+            i = block.find(rtag, start_index)
+            if i == -1:
+                return -1
+            j = block.find(ltag, start_index)
+            # if no ltag, or rtag found before another ltag, return index
+            if (j > i or j == -1):
+                return i + len(rtag)
+            # another ltag found before rtag, use end of ltag as starting
+            # point and search again
+            j = block.find('>', j)
+            start_index = self._recursive_tagfind(ltag, rtag, j + 1, block)
+            if start_index == -1:
+                # HTML potentially malformed- ltag has no corresponding
+                # rtag
+                return -1
+
+    def _get_right_tag(self, left_tag, left_index, block):
+        for p in self.right_tag_patterns:
+            tag = p % left_tag
+            i = self._recursive_tagfind(
+                "<%s" % left_tag, tag, left_index, block
+            )
+            if i > 2:
+                return tag.lstrip("<").rstrip(">"), i
+        return block.rstrip()[-left_index:-1].lower(), len(block)
+
+    def _equal_tags(self, left_tag, right_tag):
+        if left_tag[0] in ['?', '@', '%']:  # handle PHP, etc.
+            return True
+        if ("/" + left_tag) == right_tag:
+            return True
+        if (right_tag == "--" and left_tag == "--"):
+            return True
+        elif left_tag == right_tag[1:] and right_tag[0] == "/":
+            return True
+        else:
+            return False
+
+    def _is_oneliner(self, tag):
+        return (tag in ['hr', 'hr/'])
+
+    def _stringindex_to_listindex(self, stringindex, items):
+        """
+        Same effect as concatenating the strings in items,
+        finding the character to which stringindex refers in that string,
+        and returning the index of the item in which that character resides.
+        """
+        items.append('dummy')
+        i, count = 0, 0
+        while count <= stringindex:
+            count += len(items[i])
+            i += 1
+        return i - 1
+
+    def _nested_markdown_in_html(self, items):
+        """Find and process html child elements of the given element block."""
+        for i, item in enumerate(items):
+            if self.left_tag_re.match(item):
+                left_tag, left_index, attrs = \
+                    self._get_left_tag(''.join(items[i:]))
+                right_tag, data_index = self._get_right_tag(
+                    left_tag, left_index, ''.join(items[i:]))
+                right_listindex = \
+                    self._stringindex_to_listindex(data_index, items[i:]) + i
+                if 'markdown' in attrs.keys():
+                    items[i] = items[i][left_index:]  # remove opening tag
+                    placeholder = self.markdown.htmlStash.store_tag(
+                        left_tag, attrs, i + 1, right_listindex + 1)
+                    items.insert(i, placeholder)
+                    if len(items) - right_listindex <= 1:  # last nest, no tail
+                        right_listindex -= 1
+                    items[right_listindex] = items[right_listindex][
+                        :-len(right_tag) - 2]  # remove closing tag
+                else:  # raw html
+                    if len(items) - right_listindex <= 1:  # last element
+                        right_listindex -= 1
+                    if right_listindex <= i:
+                        right_listindex = i + 1
+                    placeholder = self.markdown.htmlStash.store('\n\n'.join(
+                        items[i:right_listindex]))
+                    del items[i:right_listindex]
+                    items.insert(i, placeholder)
+        return items
+
+    def run(self, lines):
+        text = "\n".join(lines)
+        new_blocks = []
+        text = text.rsplit("\n\n")
+        items = []
+        left_tag = ''
+        right_tag = ''
+        in_tag = False  # flag
+
+        while text:
+            block = text[0]
+            if block.startswith("\n"):
+                block = block[1:]
+            text = text[1:]
+
+            if block.startswith("\n"):
+                block = block[1:]
+
+            if not in_tag:
+                if block.startswith("<") and len(block.strip()) > 1:
+
+                    if block[1:4] == "!--":
+                        # is a comment block
+                        left_tag, left_index, attrs = "--", 2, {}
+                    else:
+                        left_tag, left_index, attrs = self._get_left_tag(block)
+                    right_tag, data_index = self._get_right_tag(left_tag,
+                                                                left_index,
+                                                                block)
+                    # keep checking conditions below and maybe just append
+
+                    if data_index < len(block) and (util.isBlockLevel(left_tag) or left_tag == '--'):
+                        text.insert(0, block[data_index:])
+                        block = block[:data_index]
+
+                    if not (util.isBlockLevel(left_tag) or block[1] in ["!", "?", "@", "%"]):
+                        new_blocks.append(block)
+                        continue
+
+                    if self._is_oneliner(left_tag):
+                        new_blocks.append(block.strip())
+                        continue
+
+                    if block.rstrip().endswith(">") \
+                            and self._equal_tags(left_tag, right_tag):
+                        if self.markdown_in_raw and 'markdown' in attrs.keys():
+                            block = block[left_index:-len(right_tag) - 2]
+                            new_blocks.append(self.markdown.htmlStash.
+                                              store_tag(left_tag, attrs, 0, 2))
+                            new_blocks.extend([block])
+                        else:
+                            new_blocks.append(
+                                self.markdown.htmlStash.store(block.strip()))
+                        continue
+                    else:
+                        # if is block level tag and is not complete
+                        if (not self._equal_tags(left_tag, right_tag)) and \
+                           (util.isBlockLevel(left_tag) or left_tag == "--"):
+                            items.append(block.strip())
+                            in_tag = True
+                        else:
+                            new_blocks.append(
+                                self.markdown.htmlStash.store(block.strip())
+                            )
+                        continue
+
+                else:
+                    new_blocks.append(block)
+
+            else:
+                items.append(block)
+
+                # Need to evaluate all items so we can calculate relative to the left index.
+                right_tag, data_index = self._get_right_tag(left_tag, left_index, ''.join(items))
+                # Adjust data_index: relative to items -> relative to last block
+                prev_block_length = 0
+                for item in items[:-1]:
+                    prev_block_length += len(item)
+                data_index -= prev_block_length
+
+                if self._equal_tags(left_tag, right_tag):
+                    # if find closing tag
+
+                    if data_index < len(block):
+                        # we have more text after right_tag
+                        items[-1] = block[:data_index]
+                        text.insert(0, block[data_index:])
+
+                    in_tag = False
+                    if self.markdown_in_raw and 'markdown' in attrs.keys():
+                        items[0] = items[0][left_index:]
+                        items[-1] = items[-1][:-len(right_tag) - 2]
+                        if items[len(items) - 1]:  # not a newline/empty string
+                            right_index = len(items) + 3
+                        else:
+                            right_index = len(items) + 2
+                        new_blocks.append(self.markdown.htmlStash.store_tag(
+                            left_tag, attrs, 0, right_index))
+                        placeholderslen = len(self.markdown.htmlStash.tag_data)
+                        new_blocks.extend(
+                            self._nested_markdown_in_html(items))
+                        nests = len(self.markdown.htmlStash.tag_data) - \
+                            placeholderslen
+                        self.markdown.htmlStash.tag_data[-1 - nests][
+                            'right_index'] += nests - 2
+                    else:
+                        new_blocks.append(
+                            self.markdown.htmlStash.store('\n\n'.join(items)))
+                    items = []
+
+        if items:
+            if self.markdown_in_raw and 'markdown' in attrs.keys():
+                items[0] = items[0][left_index:]
+                items[-1] = items[-1][:-len(right_tag) - 2]
+                if items[len(items) - 1]:  # not a newline/empty string
+                    right_index = len(items) + 3
+                else:
+                    right_index = len(items) + 2
+                new_blocks.append(
+                    self.markdown.htmlStash.store_tag(
+                        left_tag, attrs, 0, right_index))
+                placeholderslen = len(self.markdown.htmlStash.tag_data)
+                new_blocks.extend(self._nested_markdown_in_html(items))
+                nests = len(self.markdown.htmlStash.tag_data) - placeholderslen
+                self.markdown.htmlStash.tag_data[-1 - nests][
+                    'right_index'] += nests - 2
+            else:
+                new_blocks.append(
+                    self.markdown.htmlStash.store('\n\n'.join(items)))
+            new_blocks.append('\n')
+
+        new_text = "\n\n".join(new_blocks)
+        return new_text.split("\n")
+
+
+class ReferencePreprocessor(Preprocessor):
+    """ Remove reference definitions from text and store for later use. """
+
+    TITLE = r'[ ]*(\"(.*)\"|\'(.*)\'|\((.*)\))[ ]*'
+    RE = re.compile(
+        r'^[ ]{0,3}\[([^\]]*)\]:\s*([^ ]*)[ ]*(%s)?$' % TITLE, re.DOTALL
+    )
+    TITLE_RE = re.compile(r'^%s$' % TITLE)
+
+    def run(self, lines):
+        new_text = []
+        while lines:
+            line = lines.pop(0)
+            m = self.RE.match(line)
+            if m:
+                id = m.group(1).strip().lower()
+                link = m.group(2).lstrip('<').rstrip('>')
+                t = m.group(5) or m.group(6) or m.group(7)
+                if not t:
+                    # Check next line for title
+                    tm = self.TITLE_RE.match(lines[0])
+                    if tm:
+                        lines.pop(0)
+                        t = tm.group(2) or tm.group(3) or tm.group(4)
+                self.markdown.references[id] = (link, t)
+            else:
+                new_text.append(line)
+
+        return new_text  # + "\n"
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="Created" POS="N" name="oil.n" ID="11603" frame="Substance" frameID="1321" totalAnnotated="16" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <corpus description="Texts from Nuclear Threat Initiative website, created by Center for Non-Proliferation Studies" name="NTI" ID="135">
+            <document description="North Korea Introduction" name="NorthKorea_Introduction" ID="23481"/>
+            <document description="Iran Nuclear" name="Iran_Nuclear" ID="23511"/>
+            <document description="Iran Missile" name="Iran_Missile" ID="23512"/>
+            <document description="Iran Introduction" name="Iran_Introduction" ID="23521"/>
+            <document description="North Korea Nuclear Overview" name="NorthKorea_NuclearOverview" ID="23562"/>
+            <document description="North Korea Chemical Overview" name="NorthKorea_ChemicalOverview" ID="23611"/>
+        </corpus>
+        <corpus description="Miscellaneous" name="Miscellaneous" ID="175">
+            <document description="Iran-related Questions" name="IranRelatedQuestions" ID="23541"/>
+        </corpus>
+        <corpus description="AQUAINT Knowledge-Based Evaluation Texts" name="KBEval" ID="185">
+            <document description="Stanford" name="Stanford" ID="23576"/>
+        </corpus>
+        <corpus description="LUCorpus-v0.3" name="LUCorpus-v0.3" ID="205">
+            <document description="wsj_1640.mrg-NEW" name="wsj_1640.mrg-NEW" ID="23727"/>
+        </corpus>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="9F79EE" type="Peripheral" abbrev="con" name="Constituents"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Extra-Thematic" abbrev="des" name="Descriptor"/>
+            <FE fgColor="FFFFFF" bgColor="FF0000" type="Extra-Thematic" abbrev="Inh" name="Inherent_purpose"/>
+            <FE fgColor="FFFFFF" bgColor="008000" type="Extra-Thematic" abbrev="sou" name="Origin"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="sub" name="Substance"/>
+            <FE fgColor="FFFFFF" bgColor="FF69B4" type="Peripheral" abbrev="typ" name="Type"/>
+        </frame>
+    </header>
+    <definition>COD: a viscous liquid derived from petroleum, used especially as a fuel or lubricant.</definition>
+    <lexeme POS="N" name="oil"/>
+    <valences>
+        <governor type="Gov" lemma="refinery">
+            <annoSet ID="6525127"/>
+        </governor>
+        <FERealization total="1">
+            <FE name="Descriptor"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AJP" FE="Descriptor"/>
+                <annoSet ID="6530085"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Inherent_purpose"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="N" FE="Inherent_purpose"/>
+                <annoSet ID="6530085"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="3">
+            <FE name="Origin"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AJP" FE="Origin"/>
+                <annoSet ID="6549158"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="N" FE="Origin"/>
+                <annoSet ID="6527405"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[from]" FE="Origin"/>
+                <annoSet ID="6527552"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="16">
+            <FE name="Substance"/>
+            <pattern total="16">
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6524743"/>
+                <annoSet ID="6525127"/>
+                <annoSet ID="6525840"/>
+                <annoSet ID="6526303"/>
+                <annoSet ID="6526304"/>
+                <annoSet ID="6527404"/>
+                <annoSet ID="6527405"/>
+                <annoSet ID="6527551"/>
+                <annoSet ID="6527552"/>
+                <annoSet ID="6527733"/>
+                <annoSet ID="6530085"/>
+                <annoSet ID="6530475"/>
+                <annoSet ID="6533276"/>
+                <annoSet ID="6536204"/>
+                <annoSet ID="6549158"/>
+                <annoSet ID="6549161"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="1">
+            <FE name="Type"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AJP" FE="Type"/>
+                <annoSet ID="6525840"/>
+            </pattern>
+        </FERealization>
+        <FEGroupRealization total="1">
+            <FE name="Descriptor"/>
+            <FE name="Inherent_purpose"/>
+            <FE name="Substance"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AJP" FE="Descriptor"/>
+                <valenceUnit GF="Dep" PT="N" FE="Inherent_purpose"/>
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6530085"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="3">
+            <FE name="Origin"/>
+            <FE name="Substance"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AJP" FE="Origin"/>
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6549158"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="N" FE="Origin"/>
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6527405"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[from]" FE="Origin"/>
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6527552"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="11">
+            <FE name="Substance"/>
+            <pattern total="11">
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <annoSet ID="6524743"/>
+                <annoSet ID="6525127"/>
+                <annoSet ID="6526303"/>
+                <annoSet ID="6526304"/>
+                <annoSet ID="6527404"/>
+                <annoSet ID="6527551"/>
+                <annoSet ID="6527733"/>
+                <annoSet ID="6530475"/>
+                <annoSet ID="6533276"/>
+                <annoSet ID="6536204"/>
+                <annoSet ID="6549161"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="1">
+            <FE name="Substance"/>
+            <FE name="Type"/>
+            <pattern total="1">
+                <valenceUnit GF="" PT="DEN" FE="Substance"/>
+                <valenceUnit GF="Dep" PT="AJP" FE="Type"/>
+                <annoSet ID="6525840"/>
+            </pattern>
+        </FEGroupRealization>
+    </valences>
+    <subCorpus name="manually-added">
+        <sentence corpID="135" docID="23512" sentNo="1" paragNo="11" aPos="0" ID="4096731">
+            <text>The following year , Iran made a down payment for Project Flower by providing Israel with $280 million worth of oil .</text>
+            <annotationSet cDate="02/25/2005 12:23:06 PST Fri" status="UNANN" ID="6522396">
+                <layer rank="1" name="PENN">
+                    <label end="2" start="0" name="dt"/>
+                    <label end="12" start="4" name="VVG"/>
+                    <label end="17" start="14" name="nn"/>
+                    <label end="19" start="19" name=","/>
+                    <label end="24" start="21" name="NP"/>
+                    <label end="29" start="26" name="VVD"/>
+                    <label end="31" start="31" name="dt"/>
+                    <label end="36" start="33" name="jj"/>
+                    <label end="44" start="38" name="nn"/>
+                    <label end="48" start="46" name="in"/>
+                    <label end="56" start="50" name="NP"/>
+                    <label end="63" start="58" name="NP"/>
+                    <label end="66" start="65" name="in"/>
+                    <label end="76" start="68" name="VVG"/>
+                    <label end="83" start="78" name="NP"/>
+                    <label end="88" start="85" name="in"/>
+                    <label end="93" start="90" name="jj"/>
+                    <label end="101" start="95" name="cd"/>
+                    <label end="107" start="103" name="nn"/>
+                    <label end="110" start="109" name="in"/>
+                    <label end="114" start="112" name="nn"/>
+                    <label end="116" start="116" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="24" start="21" name="GPE"/>
+                    <label end="63" start="50" name="organization"/>
+                    <label end="83" start="78" name="GPE"/>
+                    <label end="101" start="90" name="money"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="2" start="0" name="NT"/>
+                    <label end="19" start="19" name="NT"/>
+                    <label end="24" start="21" name="NT"/>
+                    <label end="31" start="31" name="NT"/>
+                    <label end="48" start="46" name="NT"/>
+                    <label end="56" start="50" name="NT"/>
+                    <label end="63" start="58" name="NT"/>
+                    <label end="66" start="65" name="NT"/>
+                    <label end="83" start="78" name="NT"/>
+                    <label end="88" start="85" name="NT"/>
+                    <label end="101" start="95" name="NT"/>
+                    <label end="110" start="109" name="NT"/>
+                    <label end="116" start="116" name="NT"/>
+                    <label end="29" start="26" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/14/2005 04:23:50 PST Mon" status="MANUAL" ID="6524743">
+                <layer rank="1" name="Target">
+                    <label cBy="MiL" end="114" start="112" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="MiL" feID="7526" end="114" start="112" name="Substance"/>
+                </layer>
+                <layer rank="1" name="GF"/>
+                <layer rank="1" name="PT"/>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23512" sentNo="2" paragNo="24" aPos="0" ID="4096789">
+            <text>This attack was in response to a major air attack on an oil refinery in Tehran two days earlier .</text>
+            <annotationSet cDate="02/25/2005 12:23:23 PST Fri" status="UNANN" ID="6522454">
+                <layer rank="1" name="PENN">
+                    <label end="3" start="0" name="dt"/>
+                    <label end="10" start="5" name="nn"/>
+                    <label end="14" start="12" name="VBD"/>
+                    <label end="17" start="16" name="in"/>
+                    <label end="26" start="19" name="nn"/>
+                    <label end="29" start="28" name="to"/>
+                    <label end="31" start="31" name="dt"/>
+                    <label end="37" start="33" name="jj"/>
+                    <label end="41" start="39" name="nn"/>
+                    <label end="48" start="43" name="nn"/>
+                    <label end="51" start="50" name="in"/>
+                    <label end="54" start="53" name="dt"/>
+                    <label end="58" start="56" name="nn"/>
+                    <label end="67" start="60" name="nn"/>
+                    <label end="70" start="69" name="in"/>
+                    <label end="77" start="72" name="NP"/>
+                    <label end="81" start="79" name="cd"/>
+                    <label end="86" start="83" name="nns"/>
+                    <label end="94" start="88" name="rbr"/>
+                    <label end="96" start="96" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="77" start="72" name="location"/>
+                    <label end="67" start="56" name="FAC"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="3" start="0" name="NT"/>
+                    <label end="17" start="16" name="NT"/>
+                    <label end="29" start="28" name="NT"/>
+                    <label end="31" start="31" name="NT"/>
+                    <label end="51" start="50" name="NT"/>
+                    <label end="54" start="53" name="NT"/>
+                    <label end="70" start="69" name="NT"/>
+                    <label end="77" start="72" name="NT"/>
+                    <label end="81" start="79" name="NT"/>
+                    <label end="96" start="96" name="NT"/>
+                    <label end="14" start="12" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/22/2005 09:50:58 PST Tue" status="MANUAL" ID="6525127">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="58" start="56" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="7526" end="58" start="56" name="Substance"/>
+                </layer>
+                <layer rank="1" name="GF"/>
+                <layer rank="1" name="PT"/>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun">
+                    <label end="67" start="60" name="Gov"/>
+                    <label end="58" start="56" name="X"/>
+                </layer>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23481" sentNo="4" paragNo="3" aPos="0" ID="4096477">
+            <text>The U.S. responded by announcing in November 2002 that it would suspend heavy fuel oil shipments being provided under the terms of the Agreed Framework , which had led North Korea to freeze its plutonium production facilities . </text>
+            <annotationSet cDate="12/10/2004 02:34:36 PST Fri" status="UNANN" ID="6521541">
+                <layer rank="1" name="PENN">
+                    <label end="2" start="0" name="dt"/>
+                    <label end="17" start="9" name="VVD"/>
+                    <label end="31" start="22" name="VVG"/>
+                    <label end="34" start="33" name="in"/>
+                    <label end="53" start="50" name="wdt"/>
+                    <label end="56" start="55" name="PRP"/>
+                    <label end="62" start="58" name="md"/>
+                    <label end="70" start="64" name="VV"/>
+                    <label end="76" start="72" name="jj"/>
+                    <label end="81" start="78" name="nn"/>
+                    <label end="85" start="83" name="nn"/>
+                    <label end="95" start="87" name="nns"/>
+                    <label end="110" start="103" name="VVN"/>
+                    <label end="120" start="118" name="dt"/>
+                    <label end="126" start="122" name="nns"/>
+                    <label end="133" start="131" name="dt"/>
+                    <label end="158" start="154" name="wdt"/>
+                    <label end="166" start="164" name="VVN"/>
+                    <label end="181" start="180" name="to"/>
+                    <label end="188" start="183" name="VV"/>
+                    <label end="192" start="190" name="prps"/>
+                    <label end="202" start="194" name="nn"/>
+                    <label end="213" start="204" name="nn"/>
+                    <label end="224" start="215" name="nns"/>
+                    <label end="226" start="226" name="sent"/>
+                    <label end="7" start="4" name="NNP"/>
+                    <label end="20" start="19" name="in"/>
+                    <label end="43" start="36" name="NNP"/>
+                    <label end="48" start="45" name="cd"/>
+                    <label end="101" start="97" name="VBG"/>
+                    <label end="116" start="112" name="in"/>
+                    <label end="129" start="128" name="in"/>
+                    <label end="140" start="135" name="jj"/>
+                    <label end="150" start="142" name="nn"/>
+                    <label end="152" start="152" name=","/>
+                    <label end="162" start="160" name="VHD"/>
+                    <label end="172" start="168" name="NNP"/>
+                    <label end="178" start="174" name="NNP"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="7" start="4" name="GPE"/>
+                    <label end="48" start="36" name="date"/>
+                    <label end="150" start="135" name="IntAgr"/>
+                    <label end="178" start="168" name="GPE"/>
+                    <label end="224" start="194" name="FAC"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="2" start="0" name="NT"/>
+                    <label end="34" start="33" name="NT"/>
+                    <label end="53" start="50" name="NT"/>
+                    <label end="56" start="55" name="NT"/>
+                    <label end="62" start="58" name="NT"/>
+                    <label end="120" start="118" name="NT"/>
+                    <label end="133" start="131" name="NT"/>
+                    <label end="158" start="154" name="NT"/>
+                    <label end="181" start="180" name="NT"/>
+                    <label end="226" start="226" name="NT"/>
+                    <label end="20" start="19" name="NT"/>
+                    <label end="101" start="97" name="NT"/>
+                    <label end="116" start="112" name="NT"/>
+                    <label end="162" start="160" name="NT"/>
+                    <label end="192" start="190" name="NT"/>
+                    <label end="7" start="4" name="NT"/>
+                    <label end="129" start="128" name="NT"/>
+                    <label end="140" start="135" name="NT"/>
+                    <label end="150" start="142" name="NT"/>
+                    <label end="172" start="168" name="NT"/>
+                    <label end="178" start="174" name="NT"/>
+                    <label end="81" start="78" name="Nonrelational"/>
+                    <label end="48" start="45" name="NT"/>
+                    <label end="152" start="152" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="05/23/2005 01:30:58 PDT Mon" status="MANUAL" ID="6525840">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="85" start="83" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="7526" end="85" start="83" name="Substance"/>
+                    <label cBy="RLG" feID="7527" end="81" start="72" name="Type"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="81" start="72" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="81" start="72" name="AJP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Noun"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23511" sentNo="2" paragNo="5" aPos="0" ID="4096581">
+            <text>In 1973 , spurred by an influx of oil revenues , the Shah of Iran embarked on an ambitious goal of modernizing the country and building its image abroad .</text>
+            <annotationSet cDate="02/23/2005 06:30:30 PST Wed" status="UNANN" ID="6522115">
+                <layer rank="1" name="PENN">
+                    <label end="1" start="0" name="in"/>
+                    <label end="6" start="3" name="cd"/>
+                    <label end="8" start="8" name=","/>
+                    <label end="16" start="10" name="VVN"/>
+                    <label end="19" start="18" name="in"/>
+                    <label end="22" start="21" name="dt"/>
+                    <label end="29" start="24" name="nn"/>
+                    <label end="32" start="31" name="in"/>
+                    <label end="36" start="34" name="nn"/>
+                    <label end="45" start="38" name="nns"/>
+                    <label end="47" start="47" name=","/>
+                    <label end="51" start="49" name="dt"/>
+                    <label end="56" start="53" name="NP"/>
+                    <label end="59" start="58" name="in"/>
+                    <label end="64" start="61" name="NP"/>
+                    <label end="73" start="66" name="VVD"/>
+                    <label end="76" start="75" name="in"/>
+                    <label end="79" start="78" name="dt"/>
+                    <label end="89" start="81" name="jj"/>
+                    <label end="94" start="91" name="nn"/>
+                    <label end="97" start="96" name="in"/>
+                    <label end="109" start="99" name="VVG"/>
+                    <label end="113" start="111" name="dt"/>
+                    <label end="121" start="115" name="nn"/>
+                    <label end="125" start="123" name="cc"/>
+                    <label end="134" start="127" name="VVG"/>
+                    <label end="138" start="136" name="PP$"/>
+                    <label end="144" start="140" name="nn"/>
+                    <label end="151" start="146" name="rb"/>
+                    <label end="153" start="153" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="6" start="3" name="date"/>
+                    <label end="64" start="61" name="location"/>
+                    <label end="56" start="53" name="person"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="1" start="0" name="NT"/>
+                    <label end="6" start="3" name="NT"/>
+                    <label end="8" start="8" name="NT"/>
+                    <label end="19" start="18" name="NT"/>
+                    <label end="22" start="21" name="NT"/>
+                    <label end="32" start="31" name="NT"/>
+                    <label end="47" start="47" name="NT"/>
+                    <label end="51" start="49" name="NT"/>
+                    <label end="59" start="58" name="NT"/>
+                    <label end="64" start="61" name="NT"/>
+                    <label end="76" start="75" name="NT"/>
+                    <label end="79" start="78" name="NT"/>
+                    <label end="97" start="96" name="NT"/>
+                    <label end="113" start="111" name="NT"/>
+                    <label end="125" start="123" name="NT"/>
+                    <label end="138" start="136" name="NT"/>
+                    <label end="153" start="153" name="NT"/>
+                    <label end="151" start="146" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="05/31/2005 02:14:32 PDT Tue" status="MANUAL" ID="6526303">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="36" start="34" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+    

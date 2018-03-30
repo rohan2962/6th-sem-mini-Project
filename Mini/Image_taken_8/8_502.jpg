@@ -1,0 +1,721 @@
+"""
+CodeHilite Extension for Python-Markdown
+========================================
+
+Adds code/syntax highlighting to standard Python-Markdown code blocks.
+
+See <https://pythonhosted.org/Markdown/extensions/code_hilite.html>
+for documentation.
+
+Original code Copyright 2006-2008 [Waylan Limberg](http://achinghead.com/).
+
+All changes Copyright 2008-2014 The Python Markdown Project
+
+License: [BSD](http://www.opensource.org/licenses/bsd-license.php)
+
+"""
+
+from __future__ import absolute_import
+from __future__ import unicode_literals
+from . import Extension
+from ..treeprocessors import Treeprocessor
+
+try:
+    from pygments import highlight
+    from pygments.lexers import get_lexer_by_name, guess_lexer
+    from pygments.formatters import get_formatter_by_name
+    pygments = True
+except ImportError:
+    pygments = False
+
+
+def parse_hl_lines(expr):
+    """Support our syntax for emphasizing certain lines of code.
+
+    expr should be like '1 2' to emphasize lines 1 and 2 of a code block.
+    Returns a list of ints, the line numbers to emphasize.
+    """
+    if not expr:
+        return []
+
+    try:
+        return list(map(int, expr.split()))
+    except ValueError:
+        return []
+
+
+# ------------------ The Main CodeHilite Class ----------------------
+class CodeHilite(object):
+    """
+    Determine language of source code, and pass it into pygments hilighter.
+
+    Basic Usage:
+        >>> code = CodeHilite(src = 'some text')
+        >>> html = code.hilite()
+
+    * src: Source string or any object with a .readline attribute.
+
+    * linenums: (Boolean) Set line numbering to 'on' (True),
+      'off' (False) or 'auto'(None). Set to 'auto' by default.
+
+    * guess_lang: (Boolean) Turn language auto-detection
+      'on' or 'off' (on by default).
+
+    * css_class: Set class name of wrapper div ('codehilite' by default).
+
+    * hl_lines: (List of integers) Lines to emphasize, 1-indexed.
+
+    Low Level Usage:
+        >>> code = CodeHilite()
+        >>> code.src = 'some text' # String or anything with a .readline attr.
+        >>> code.linenos = True  # Turns line numbering on or of.
+        >>> html = code.hilite()
+
+    """
+
+    def __init__(self, src=None, linenums=None, guess_lang=True,
+                 css_class="codehilite", lang=None, style='default',
+                 noclasses=False, tab_length=4, hl_lines=None, use_pygments=True):
+        self.src = src
+        self.lang = lang
+        self.linenums = linenums
+        self.guess_lang = guess_lang
+        self.css_class = css_class
+        self.style = style
+        self.noclasses = noclasses
+        self.tab_length = tab_length
+        self.hl_lines = hl_lines or []
+        self.use_pygments = use_pygments
+
+    def hilite(self):
+        """
+        Pass code to the [Pygments](http://pygments.pocoo.org/) highliter with
+        optional line numbers. The output should then be styled with css to
+        your liking. No styles are applied by default - only styling hooks
+        (i.e.: <span class="k">).
+
+        returns : A string of html.
+
+        """
+
+        self.src = self.src.strip('\n')
+
+        if self.lang is None:
+            self._parseHeader()
+
+        if pygments and self.use_pygments:
+            try:
+                lexer = get_lexer_by_name(self.lang)
+            except ValueError:
+                try:
+                    if self.guess_lang:
+                        lexer = guess_lexer(self.src)
+                    else:
+                        lexer = get_lexer_by_name('text')
+                except ValueError:
+                    lexer = get_lexer_by_name('text')
+            formatter = get_formatter_by_name('html',
+                                              linenos=self.linenums,
+                                              cssclass=self.css_class,
+                                              style=self.style,
+                                              noclasses=self.noclasses,
+                                              hl_lines=self.hl_lines)
+            return highlight(self.src, lexer, formatter)
+        else:
+            # just escape and build markup usable by JS highlighting libs
+            txt = self.src.replace('&', '&amp;')
+            txt = txt.replace('<', '&lt;')
+            txt = txt.replace('>', '&gt;')
+            txt = txt.replace('"', '&quot;')
+            classes = []
+            if self.lang:
+                classes.append('language-%s' % self.lang)
+            if self.linenums:
+                classes.append('linenums')
+            class_str = ''
+            if classes:
+                class_str = ' class="%s"' % ' '.join(classes)
+            return '<pre class="%s"><code%s>%s</code></pre>\n' % \
+                   (self.css_class, class_str, txt)
+
+    def _parseHeader(self):
+        """
+        Determines language of a code block from shebang line and whether said
+        line should be removed or left in place. If the sheband line contains a
+        path (even a single /) then it is assumed to be a real shebang line and
+        left alone. However, if no path is given (e.i.: #!python or :::python)
+        then it is assumed to be a mock shebang for language identifitation of
+        a code fragment and removed from the code block prior to processing for
+        code highlighting. When a mock shebang (e.i: #!python) is found, line
+        numbering is turned on. When colons are found in place of a shebang
+        (e.i.: :::python), line numbering is left in the current state - off
+        by default.
+
+        Also parses optional list of highlight lines, like:
+
+            :::python hl_lines="1 3"
+        """
+
+        import re
+
+        # split text into lines
+        lines = self.src.split("\n")
+        # pull first line to examine
+        fl = lines.pop(0)
+
+        c = re.compile(r'''
+            (?:(?:^::+)|(?P<shebang>^[#]!)) # Shebang or 2 or more colons
+            (?P<path>(?:/\w+)*[/ ])?        # Zero or 1 path
+            (?P<lang>[\w#.+-]*)             # The language
+            \s*                             # Arbitrary whitespace
+            # Optional highlight lines, single- or double-quote-delimited
+            (hl_lines=(?P<quot>"|')(?P<hl_lines>.*?)(?P=quot))?
+            ''',  re.VERBOSE)
+        # search first line for shebang
+        m = c.search(fl)
+        if m:
+            # we have a match
+            try:
+                self.lang = m.group('lang').lower()
+            except IndexError:
+                self.lang = None
+            if m.group('path'):
+                # path exists - restore first line
+                lines.insert(0, fl)
+            if self.linenums is None and m.group('shebang'):
+                # Overridable and Shebang exists - use line numbers
+                self.linenums = True
+
+            self.hl_lines = parse_hl_lines(m.group('hl_lines'))
+        else:
+            # No match
+            lines.insert(0, fl)
+
+        self.src = "\n".join(lines).strip("\n")
+
+
+# ------------------ The Markdown Extension -------------------------------
+
+
+class HiliteTreeprocessor(Treeprocessor):
+    """ Hilight source code in code blocks. """
+
+    def run(self, root):
+        """ Find code blocks and store in htmlStash. """
+        blocks = root.iter('pre')
+        for block in blocks:
+            if len(block) == 1 and block[0].tag == 'code':
+                code = CodeHilite(
+                    block[0].text,
+                    linenums=self.config['linenums'],
+                    guess_lang=self.config['guess_lang'],
+                    css_class=self.config['css_class'],
+                    style=self.config['pygments_style'],
+                    noclasses=self.config['noclasses'],
+                    tab_length=self.markdown.tab_length,
+                    use_pygments=self.config['use_pygments']
+                )
+                placeholder = self.markdown.htmlStash.store(code.hilite(),
+                                                            safe=True)
+                # Clear codeblock in etree instance
+                block.clear()
+                # Change to p element which will later
+                # be removed when inserting raw html
+                block.tag = 'p'
+                block.text = placeholder
+
+
+class CodeHiliteExtension(Extension):
+    """ Add source code hilighting to markdown codeblocks. """
+
+    def __init__(self, *args, **kwargs):
+        # define default configs
+        self.config = {
+            'linenums': [None,
+                         "Use lines numbers. True=yes, False=no, None=auto"],
+            'guess_lang': [True,
+                           "Automatic language detection - Default: True"],
+            'css_class': ["codehilite",
+                          "Set class name for wrapper <div> - "
+                          "Default: codehilite"],
+            'pygments_style': ['default',
+                               'Pygments HTML Formatter Style '
+                               '(Colorscheme) - Default: default'],
+            'noclasses': [False,
+                          'Use inline styles instead of CSS classes - '
+                          'Default false'],
+            'use_pygments': [True,
+                             'Use Pygments to Highlight code blocks. '
+                             'Disable if using a JavaScript library. '
+                             'Default: True']
+            }
+
+        super(CodeHiliteExtension, self).__init__(*args, **kwargs)
+
+    def extendMarkdown(self, md, md_globals):
+        """ Add HilitePostprocessor to Markdown instance. """
+        hiliter = HiliteTreeprocessor(md)
+        hiliter.config = self.getConfigs()
+        md.treeprocessors.add("hilite", hiliter, "<inline")
+
+        md.registerExtension(self)
+
+
+def makeExtension(*args, **kwargs):
+    return CodeHiliteExtension(*args, **kwargs)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<?xml-stylesheet type="text/xsl" href="lexUnit.xsl"?>
+<lexUnit status="Created" POS="A" name="advanced.a" ID="11650" frame="Stage_of_progress" frameID="1341" totalAnnotated="13" xsi:schemaLocation="../schema/lexUnit.xsd" xmlns="http://framenet.icsi.berkeley.edu" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <header>
+        <corpus description="Texts from Nuclear Threat Initiative website, created by Center for Non-Proliferation Studies" name="NTI" ID="135">
+            <document description="Iran Nuclear" name="Iran_Nuclear" ID="23511"/>
+            <document description="Iran Biological" name="Iran_Biological" ID="23513"/>
+            <document description="Iran Chemical" name="Iran_Chemical" ID="23514"/>
+            <document description="North Korea Nuclear Capabilities" name="NorthKorea_NuclearCapabilities" ID="23561"/>
+            <document description="South Africa Introduction" name="SouthAfrica_Introduction" ID="23571"/>
+        </corpus>
+        <corpus description="AQUAINT Knowledge-Based Evaluation Texts" name="KBEval" ID="185">
+            <document description="lcch" name="lcch" ID="23574"/>
+        </corpus>
+        <corpus description="American National Corpus Texts" name="ANC" ID="195">
+            <document description="Berlitz History of Las Vegas" name="HistoryOfLasVegas" ID="23691"/>
+        </corpus>
+        <corpus description="LUCorpus-v0.3" name="LUCorpus-v0.3" ID="205">
+            <document description="artb_004_A1_E2_NEW" name="artb_004_A1_E2_NEW" ID="23716"/>
+        </corpus>
+        <frame>
+            <FE fgColor="FFFFFF" bgColor="800080" type="Peripheral" abbrev="deg" name="Degree"/>
+            <FE fgColor="FFFFFF" bgColor="FF0000" type="Peripheral" abbrev="dom" name="Domain"/>
+            <FE fgColor="FFFFFF" bgColor="0000FF" type="Core" abbrev="ent" name="Entity"/>
+            <FE fgColor="FFFFFF" bgColor="FF00FF" type="Peripheral" abbrev="man" name="Manner"/>
+            <FE fgColor="FFFFFF" bgColor="FFA500" type="Peripheral" abbrev="tim" name="Time"/>
+        </frame>
+    </header>
+    <definition>COD: far on in progress or life</definition>
+    <lexeme POS="A" name="advanced"/>
+    <valences>
+        <FERealization total="5">
+            <FE name="Degree"/>
+            <pattern total="5">
+                <valenceUnit GF="Dep" PT="AVP" FE="Degree"/>
+                <annoSet ID="6523396"/>
+                <annoSet ID="6523795"/>
+                <annoSet ID="6523824"/>
+                <annoSet ID="6534024"/>
+                <annoSet ID="6534163"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Degree"/>
+                <annoSet ID="6523396"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Degree"/>
+                <annoSet ID="6523795"/>
+            </pattern>
+        </FERealization>
+        <FERealization total="13">
+            <FE name="Entity"/>
+            <pattern total="9">
+                <valenceUnit GF="Head" PT="N" FE="Entity"/>
+                <annoSet ID="6523396"/>
+                <annoSet ID="6523468"/>
+                <annoSet ID="6523703"/>
+                <annoSet ID="6523824"/>
+                <annoSet ID="6524580"/>
+                <annoSet ID="6528943"/>
+                <annoSet ID="6532750"/>
+                <annoSet ID="6543880"/>
+                <annoSet ID="6545190"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="" PT="DNI" FE="Entity"/>
+                <annoSet ID="6523795"/>
+            </pattern>
+            <pattern total="3">
+                <valenceUnit GF="Ext" PT="NP" FE="Entity"/>
+                <annoSet ID="6523367"/>
+                <annoSet ID="6534024"/>
+                <annoSet ID="6534163"/>
+            </pattern>
+        </FERealization>
+        <FEGroupRealization total="2">
+            <FE name="Degree"/>
+            <FE name="Degree"/>
+            <FE name="Entity"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Degree"/>
+                <valenceUnit GF="Dep" PT="PP[in]" FE="Degree"/>
+                <valenceUnit GF="Head" PT="N" FE="Entity"/>
+                <annoSet ID="6523396"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Degree"/>
+                <valenceUnit GF="Dep" PT="PP[of]" FE="Degree"/>
+                <valenceUnit GF="" PT="DNI" FE="Entity"/>
+                <annoSet ID="6523795"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="3">
+            <FE name="Degree"/>
+            <FE name="Entity"/>
+            <pattern total="1">
+                <valenceUnit GF="Dep" PT="AVP" FE="Degree"/>
+                <valenceUnit GF="Head" PT="N" FE="Entity"/>
+                <annoSet ID="6523824"/>
+            </pattern>
+            <pattern total="2">
+                <valenceUnit GF="Dep" PT="AVP" FE="Degree"/>
+                <valenceUnit GF="Ext" PT="NP" FE="Entity"/>
+                <annoSet ID="6534024"/>
+                <annoSet ID="6534163"/>
+            </pattern>
+        </FEGroupRealization>
+        <FEGroupRealization total="8">
+            <FE name="Entity"/>
+            <pattern total="7">
+                <valenceUnit GF="Head" PT="N" FE="Entity"/>
+                <annoSet ID="6523468"/>
+                <annoSet ID="6523703"/>
+                <annoSet ID="6524580"/>
+                <annoSet ID="6528943"/>
+                <annoSet ID="6532750"/>
+                <annoSet ID="6543880"/>
+                <annoSet ID="6545190"/>
+            </pattern>
+            <pattern total="1">
+                <valenceUnit GF="Ext" PT="NP" FE="Entity"/>
+                <annoSet ID="6523367"/>
+            </pattern>
+        </FEGroupRealization>
+    </valences>
+    <subCorpus name="manually-added">
+        <sentence corpID="135" docID="23511" sentNo="4" paragNo="8" aPos="0" ID="4096595">
+            <text>By the time of the Islamic Revolution in January 1979 , Iran 's nuclear program was considered one the most advanced in the Middle East .</text>
+            <annotationSet cDate="02/23/2005 06:30:35 PST Wed" status="UNANN" ID="6522129">
+                <layer rank="1" name="PENN">
+                    <label end="1" start="0" name="in"/>
+                    <label end="5" start="3" name="dt"/>
+                    <label end="10" start="7" name="nn"/>
+                    <label end="13" start="12" name="in"/>
+                    <label end="17" start="15" name="dt"/>
+                    <label end="25" start="19" name="jj"/>
+                    <label end="36" start="27" name="nn"/>
+                    <label end="39" start="38" name="in"/>
+                    <label end="47" start="41" name="NP"/>
+                    <label end="52" start="49" name="cd"/>
+                    <label end="54" start="54" name=","/>
+                    <label end="59" start="56" name="NP"/>
+                    <label end="62" start="61" name="POS"/>
+                    <label end="70" start="64" name="jj"/>
+                    <label end="78" start="72" name="nn"/>
+                    <label end="82" start="80" name="VBD"/>
+                    <label end="93" start="84" name="VVN"/>
+                    <label end="97" start="95" name="nn"/>
+                    <label end="101" start="99" name="dt"/>
+                    <label end="106" start="103" name="rbs"/>
+                    <label end="115" start="108" name="jj"/>
+                    <label end="118" start="117" name="in"/>
+                    <label end="122" start="120" name="dt"/>
+                    <label end="129" start="124" name="NP"/>
+                    <label end="134" start="131" name="NP"/>
+                    <label end="136" start="136" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="52" start="41" name="date"/>
+                    <label end="59" start="56" name="GPE"/>
+                    <label end="134" start="124" name="location"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="1" start="0" name="NT"/>
+                    <label end="5" start="3" name="NT"/>
+                    <label end="13" start="12" name="NT"/>
+                    <label end="17" start="15" name="NT"/>
+                    <label end="39" start="38" name="NT"/>
+                    <label end="47" start="41" name="NT"/>
+                    <label end="52" start="49" name="NT"/>
+                    <label end="54" start="54" name="NT"/>
+                    <label end="59" start="56" name="NT"/>
+                    <label end="62" start="61" name="NT"/>
+                    <label end="101" start="99" name="NT"/>
+                    <label end="118" start="117" name="NT"/>
+                    <label end="122" start="120" name="NT"/>
+                    <label end="129" start="124" name="NT"/>
+                    <label end="134" start="131" name="NT"/>
+                    <label end="136" start="136" name="NT"/>
+                    <label end="82" start="80" name="NT"/>
+                    <label end="106" start="103" name="NT"/>
+                    <label end="36" start="19" name="NT"/>
+                    <label end="70" start="64" name="Nonrelational"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/03/2005 10:34:12 PST Thu" status="MANUAL" ID="6523367">
+                <layer rank="1" name="Target">
+                    <label cBy="RLG" end="115" start="108" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="RLG" feID="7567" end="78" start="56" name="Entity"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="78" start="56" name="Ext"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="78" start="56" name="NP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Adj"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23513" sentNo="1" paragNo="20" aPos="0" ID="4096944">
+            <text>Iran has one of the most advanced biotech industries in the developing world , and has long been recognized as a leader in Southwest Asia in the fields of vaccine research and production .</text>
+            <annotationSet cDate="02/25/2005 12:37:35 PST Fri" status="UNANN" ID="6522609">
+                <layer rank="1" name="PENN">
+                    <label end="3" start="0" name="NP"/>
+                    <label end="7" start="5" name="VHZ"/>
+                    <label end="11" start="9" name="cd"/>
+                    <label end="14" start="13" name="in"/>
+                    <label end="18" start="16" name="dt"/>
+                    <label end="23" start="20" name="rbs"/>
+                    <label end="32" start="25" name="jj"/>
+                    <label end="40" start="34" name="nn"/>
+                    <label end="51" start="42" name="nns"/>
+                    <label end="54" start="53" name="in"/>
+                    <label end="58" start="56" name="dt"/>
+                    <label end="69" start="60" name="VVG"/>
+                    <label end="75" start="71" name="nn"/>
+                    <label end="77" start="77" name=","/>
+                    <label end="81" start="79" name="cc"/>
+                    <label end="85" start="83" name="VHZ"/>
+                    <label end="90" start="87" name="rb"/>
+                    <label end="95" start="92" name="VBN"/>
+                    <label end="106" start="97" name="VVN"/>
+                    <label end="109" start="108" name="in"/>
+                    <label end="111" start="111" name="dt"/>
+                    <label end="118" start="113" name="nn"/>
+                    <label end="121" start="120" name="in"/>
+                    <label end="131" start="123" name="NP"/>
+                    <label end="136" start="133" name="NP"/>
+                    <label end="139" start="138" name="in"/>
+                    <label end="143" start="141" name="dt"/>
+                    <label end="150" start="145" name="nns"/>
+                    <label end="153" start="152" name="in"/>
+                    <label end="161" start="155" name="nn"/>
+                    <label end="170" start="163" name="nn"/>
+                    <label end="174" start="172" name="cc"/>
+                    <label end="185" start="176" name="nn"/>
+                    <label end="187" start="187" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="3" start="0" name="location"/>
+                    <label end="136" start="123" name="location"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="3" start="0" name="NT"/>
+                    <label end="11" start="9" name="NT"/>
+                    <label end="14" start="13" name="NT"/>
+                    <label end="18" start="16" name="NT"/>
+                    <label end="54" start="53" name="NT"/>
+                    <label end="58" start="56" name="NT"/>
+                    <label end="77" start="77" name="NT"/>
+                    <label end="81" start="79" name="NT"/>
+                    <label end="109" start="108" name="NT"/>
+                    <label end="111" start="111" name="NT"/>
+                    <label end="121" start="120" name="NT"/>
+                    <label end="131" start="123" name="NT"/>
+                    <label end="136" start="133" name="NT"/>
+                    <label end="139" start="138" name="NT"/>
+                    <label end="143" start="141" name="NT"/>
+                    <label end="153" start="152" name="NT"/>
+                    <label end="174" start="172" name="NT"/>
+                    <label end="187" start="187" name="NT"/>
+                    <label end="23" start="20" name="NT"/>
+                    <label end="85" start="83" name="NT"/>
+                    <label end="90" start="87" name="NT"/>
+                    <label end="95" start="92" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/03/2005 11:18:07 PST Thu" status="MANUAL" ID="6523396">
+                <layer rank="1" name="Target">
+                    <label cBy="JKR" end="32" start="25" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="JKR" feID="7567" end="51" start="34" name="Entity"/>
+                    <label cBy="JKR" feID="7574" end="23" start="20" name="Degree"/>
+                    <label cBy="JKR" feID="7574" end="75" start="53" name="Degree"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="51" start="34" name="Head"/>
+                    <label end="23" start="20" name="Dep"/>
+                    <label end="75" start="53" name="Dep"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="51" start="34" name="N"/>
+                    <label end="23" start="20" name="AVP"/>
+                    <label end="75" start="53" name="PP"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Adj"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23513" sentNo="4" paragNo="24" aPos="0" ID="4096954">
+            <text>Today , all three facilities undertake projects requiring advanced microbiology and genetic engineering equipment and expertise that could be applied toward the production of biological weapons .</text>
+            <annotationSet cDate="02/25/2005 12:37:38 PST Fri" status="UNANN" ID="6522619">
+                <layer rank="1" name="PENN">
+                    <label end="4" start="0" name="nn"/>
+                    <label end="6" start="6" name=","/>
+                    <label end="10" start="8" name="dt"/>
+                    <label end="16" start="12" name="cd"/>
+                    <label end="27" start="18" name="nns"/>
+                    <label end="37" start="29" name="VV"/>
+                    <label end="46" start="39" name="nns"/>
+                    <label end="56" start="48" name="VVG"/>
+                    <label end="65" start="58" name="jj"/>
+                    <label end="78" start="67" name="nn"/>
+                    <label end="82" start="80" name="cc"/>
+                    <label end="90" start="84" name="jj"/>
+                    <label end="102" start="92" name="nn"/>
+                    <label end="112" start="104" name="nn"/>
+                    <label end="116" start="114" name="cc"/>
+                    <label end="126" start="118" name="nn"/>
+                    <label end="131" start="128" name="wdt"/>
+                    <label end="137" start="133" name="md"/>
+                    <label end="140" start="139" name="vb"/>
+                    <label end="148" start="142" name="VVN"/>
+                    <label end="155" start="150" name="in"/>
+                    <label end="159" start="157" name="dt"/>
+                    <label end="170" start="161" name="nn"/>
+                    <label end="173" start="172" name="in"/>
+                    <label end="184" start="175" name="jj"/>
+                    <label end="192" start="186" name="nns"/>
+                    <label end="194" start="194" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="192" start="175" name="WEA"/>
+                    <label end="4" start="0" name="date"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="6" start="6" name="NT"/>
+                    <label end="10" start="8" name="NT"/>
+                    <label end="16" start="12" name="NT"/>
+                    <label end="82" start="80" name="NT"/>
+                    <label end="116" start="114" name="NT"/>
+                    <label end="131" start="128" name="NT"/>
+                    <label end="137" start="133" name="NT"/>
+                    <label end="155" start="150" name="NT"/>
+                    <label end="159" start="157" name="NT"/>
+                    <label end="173" start="172" name="NT"/>
+                    <label end="194" start="194" name="NT"/>
+                    <label end="140" start="139" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/03/2005 01:34:50 PST Thu" status="MANUAL" ID="6523468">
+                <layer rank="1" name="Target">
+                    <label cBy="JKR" end="65" start="58" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="JKR" feID="7567" end="126" start="67" name="Entity"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="126" start="67" name="Head"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="126" start="67" name="N"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Adj"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23513" sentNo="5" paragNo="16" aPos="0" ID="4096938">
+            <text>Similar , presumably legitimate advanced research is being carried out at the National Research Center for Genetic Engineering and Biotechnology near Tehran .</text>
+            <annotationSet cDate="02/25/2005 12:37:34 PST Fri" status="UNANN" ID="6522603">
+                <layer rank="1" name="PENN">
+                    <label end="6" start="0" name="jj"/>
+                    <label end="8" start="8" name=","/>
+                    <label end="19" start="10" name="rb"/>
+                    <label end="30" start="21" name="jj"/>
+                    <label end="39" start="32" name="jj"/>
+                    <label end="48" start="41" name="nn"/>
+                    <label end="51" start="50" name="VBZ"/>
+                    <label end="57" start="53" name="VBG"/>
+                    <label end="65" start="59" name="VVN"/>
+                    <label end="69" start="67" name="rp"/>
+                    <label end="72" start="71" name="in"/>
+                    <label end="76" start="74" name="dt"/>
+                    <label end="85" start="78" name="NP"/>
+                    <label end="94" start="87" name="NP"/>
+                    <label end="101" start="96" name="NP"/>
+                    <label end="105" start="103" name="in"/>
+                    <label end="113" start="107" name="NP"/>
+                    <label end="125" start="115" name="NP"/>
+                    <label end="129" start="127" name="cc"/>
+                    <label end="143" start="131" name="NP"/>
+                    <label end="148" start="145" name="in"/>
+                    <label end="155" start="150" name="NP"/>
+                    <label end="157" start="157" name="sent"/>
+                </layer>
+                <layer rank="1" name="NER">
+                    <label end="155" start="150" name="location"/>
+                    <label end="143" start="78" name="FAC"/>
+                </layer>
+                <layer rank="1" name="WSL">
+                    <label end="8" start="8" name="NT"/>
+                    <label end="69" start="67" name="NT"/>
+                    <label end="72" start="71" name="NT"/>
+                    <label end="76" start="74" name="NT"/>
+                    <label end="85" start="78" name="NT"/>
+                    <label end="94" start="87" name="NT"/>
+                    <label end="101" start="96" name="NT"/>
+                    <label end="105" start="103" name="NT"/>
+                    <label end="113" start="107" name="NT"/>
+                    <label end="125" start="115" name="NT"/>
+                    <label end="129" start="127" name="NT"/>
+                    <label end="143" start="131" name="NT"/>
+                    <label end="148" start="145" name="NT"/>
+                    <label end="155" start="150" name="NT"/>
+                    <label end="157" start="157" name="NT"/>
+                    <label end="51" start="50" name="NT"/>
+                    <label end="57" start="53" name="NT"/>
+                    <label end="19" start="10" name="NT"/>
+                </layer>
+            </annotationSet>
+            <annotationSet cDate="03/03/2005 06:13:19 PST Thu" status="MANUAL" ID="6523703">
+                <layer rank="1" name="Target">
+                    <label cBy="JKR" end="39" start="32" name="Target"/>
+                </layer>
+                <layer rank="1" name="FE">
+                    <label cBy="JKR" feID="7567" end="48" start="41" name="Entity"/>
+                </layer>
+                <layer rank="1" name="GF">
+                    <label end="48" start="41" name="Head"/>
+                </layer>
+                <layer rank="1" name="PT">
+                    <label end="48" start="41" name="N"/>
+                </layer>
+                <layer rank="1" name="Other"/>
+                <layer rank="1" name="Sent"/>
+                <layer rank="1" name="Adj"/>
+            </annotationSet>
+        </sentence>
+        <sentence corpID="135" docID="23513" sentNo="3" paragNo="24" aPos="0" ID="4096953">
+            <text>The Razi and Pasteur Institutes have vaccine development and production experience dating back to the 1920s , and for many years both of these facilities were recognized among the most advanced of their kind in the developing world .</text>
+            <annotationSet cDate="02/25/2005 12:37:37 PST Fri" status="UNANN" ID="6522618">
+                <layer rank="1" name="PENN">
+                    <label end="2" start="0" name="dt"/>
+                    <label end="7" start="4" name="NP"/>
+                    <label end="11" start="9" name="cc"/>
+                    <label end="19" start="13" name="NP"/>
+                    <label end="30" start="21" name="NPS"/>
+                    <label end="35" start="32" name="VHP"/>
+                    <label end="43" start="37" name="nn"/>
+                    <label end="55" start="45" name="nn"/>
+                    <label end="59" start="57" name="cc"/>
+                    <label end="70" start="61" name="nn"/>
+                    <label end="81" start="72" name="nn"/>
+                    <label end="88" start="83" name="VVG"/>
+                    <label end="93" start="90" name="rb"/>
+                    <label end="96" start="95" name="to"/>
+                    <label end="100" start="98" name="dt"/>
+                    <label end="106" start="102" name="nns"/>
+                    <label end="108" start="108" name=","
