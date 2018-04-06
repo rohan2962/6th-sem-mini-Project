@@ -100,6 +100,7 @@ X2d=[[]for i in range(10)]
 for i in range(len(X)):
     X2d[y[i]].append(X[i])
 print(len(X2d[0]))
+print(len(X2d[0][0]))
 for i in range(10):
     for j in range(4000):
         y_train.append(i)
@@ -107,7 +108,7 @@ for i in range(10):
     for j in range(4000,len(X2d[i])):
         y_test.append(i)
         X_test.append(X2d[i][j])
-bsvm=svm.SVC(gamma=0.05,C=5)
+bsvm=svm.SVC(gamma=0.00005,C=0.5)
 print(bsvm)
 bsvm.fit(X_train,y_train)
 print(accuracy_score(bsvm.predict(X_test),y_test))
