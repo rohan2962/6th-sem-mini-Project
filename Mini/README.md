@@ -16,7 +16,9 @@ There are various codes but the important ones are as follows -
 Feature Extraction codes -
 
 1 Run length plus scan line - diagonal_feature.py
+
 2 Zone based - Zone_based_extraction.py
+
 3 Scan line - Feature_extraction.py
 
 
