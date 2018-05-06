@@ -7,6 +7,7 @@ from sklearn.cross_validation import train_test_split
 import pandas as pd
 import math
 import cvxopt
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 
 
@@ -147,7 +148,7 @@ for dig in range(10):
                     continue
                 pcc=np.corrcoef(X1_r.T[i],X2_r.T[j])[0][1]
                 pcc=np.cov(X1_r.T[i],X2_r.T[j])[0][1]/(cv1*cv2)
-                #print(i,j,pcc,np.corrcoef(X1_r.T[i],X2_r.T[j])[0][1])
+                print(i,j,pcc,np.corrcoef(X1_r.T[i],X2_r.T[j])[0][1])
                 if pcc*10 >= 0.6:
                     if cv1>=cv2:
                         a2[j]=0

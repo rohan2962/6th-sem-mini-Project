@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 
 print(np.corrcoef([20,23,8,29,14,11,11,20,17,17],[30,35,21,33,33,26,22,31,33,36])[0][1])
 
@@ -25,3 +26,17 @@ print(f)
 
 s="-12"
 print(int(s))
+
+a=[[3,4,-1,51],[42,50,-1,8]]
+a=np.array(a)
+scaler=StandardScaler()
+print(scaler.fit_transform(a))
+
+a=[[1,2,4]]
+b=[[5,6,7]]
+a=np.array(a)
+b=np.array(b)
+print(np.hstack((a,b)))
+
+a=[[1,3],[5,6]]
+print(a[:][1])

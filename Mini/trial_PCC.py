@@ -12,6 +12,9 @@ from sklearn.metrics import accuracy_score
 
 def one_class_svm(X_train,X_test,y_train,y_test,digit):
     print('For digit '+str(digit))
+    X_train=np.array(X_train)
+    y_train=np.array(y_train)
+    print(X_train.shape,y_train.shape)
     clf = svm.OneClassSVM(kernel='rbf', gamma=0.5, nu=0.1)
     clf.fit(X_train, y_train)
     print('Built in classifiers accuracy is ' + str(accuracy_score(y_test, clf.predict(X_test)) * 100) + '%')
@@ -95,9 +98,9 @@ for i in range(0,10):
     read_file(open('features_mnist_more_'+str(i)+'.txt','r'),274,1)
 
 gc=0
-
-for i in range(0,10):
-    read_file(open('features_more_'+str(i)+'.txt','r'),494,2)
+for x in range(10):
+    for i in range(0,10):
+        read_file(open('features_more_'+str(i)+'.txt','r'),494,2,600)
 print(xxxx)
 print(rang)
 print(rang_nhrr)
@@ -108,11 +111,11 @@ Xp_nhrr = []
 
 for dig in range(10):
     if dig==0:
-        Xp=conv_data_apply_pca(X[rang[dig][0]:rang[dig][1]+1],20)
-        Xp_nhrr=conv_data_apply_pca(X_nhrr[rang_nhrr[dig][0]:rang_nhrr[dig][1]+1],20)
+        Xp=X[rang[dig][0]:rang[dig][1]+1]
+        Xp_nhrr=X_nhrr[rang_nhrr[dig][0]:rang_nhrr[dig][1]+1]
     else:
-        Xp=np.concatenate([Xp,conv_data_apply_pca(X[rang[dig][0]:rang[dig][1]+1],20)])
-        Xp_nhrr=np.concatenate([Xp_nhrr,conv_data_apply_pca(X_nhrr[rang_nhrr[dig][0]:rang_nhrr[dig][1]+1],20)])
+        Xp=np.concatenate([Xp,X[rang[dig][0]:rang[dig][1]+1]])
+        Xp_nhrr=np.concatenate([Xp_nhrr,X_nhrr[rang_nhrr[dig][0]:rang_nhrr[dig][1]+1]])
 
 for dig in range(10):
     X1=[]
@@ -140,9 +143,9 @@ for dig in range(10):
     rohan=[]
     for it2 in range(9):
 
-        X1_r=np.array(X2[it1:it1+60])
-        X1_r=conv_data_apply_pca(X1_r,20)
-        print(it1,it1+60)
+        X1_r=np.array(X1[it1:it1+600])
+        #X1_r=conv_data_apply_pca(X1_r,25)
+        print(it1,it1+600)
 
         f1=len(X1_r[0])
 
@@ -167,7 +170,7 @@ for dig in range(10):
         y_test=[]
 
 
-        X_test=np.concatenate([Xp,Xp_nhrr])
+        X_test=Xp
 
         #dig=1
         for i in range(0,len(rang)):
@@ -177,13 +180,13 @@ for dig in range(10):
                 else:
                     y_test.append(-1)
 
-        for i in range(0, len(rang_nhrr)):
+        '''for i in range(0, len(rang_nhrr)):
             for j in range(rang_nhrr[i][0], rang_nhrr[i][1] + 1):
                 if i == dig:
                     y_test.append(1)
                 else:
                     y_test.append(-1)
-
+        '''
 
         print('For digit ',str(dig),'Iteration ',str(it2+1))
         one_class_svm(X1r1,X_test,y1r1,y_test,dig)

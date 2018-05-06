@@ -6,6 +6,7 @@ import numpy.linalg as linalg
 from sklearn.cross_validation import train_test_split
 import pandas as pd
 import math
+from sklearn.decomposition import PCA
 import cvxopt
 from sklearn.metrics import accuracy_score
 
@@ -140,6 +141,7 @@ mean=np.mean(X,axis=0)
 normalized=X-mean
 cov_matrix=np.cov(normalized.T)
 eigen_values,eigen_vectors=linalg.eig(cov_matrix)
+print(eigen_vectors.shape)
 #eigen_vectors=eigen_vectors[:,0:20]
 #conv_data=np.dot(eigen_vectors.T,normalized.T).T
 #X=conv_data
@@ -166,12 +168,35 @@ optk=20
 
 #print(optk)
 eigen_vectors=eigen_vectors[:,0:optk]
-print(eigen_vectors)
+print(eigen_vectors.shape)
 print()
 print()
 print(eigen_values[0:20])
 conv_data=np.dot(eigen_vectors.T,normalized.T).T
+
+pca = PCA(20)
+pca.fit(X)
+print(pca.singular_values_)
+#print(pca.explained_variance_)
+X = pca.transform(X)
+
+
+
+
+for i in range(10):
+    yi=[-1 for i in range(len(y))]
+    yi=np.array(yi);
+    yi[rang[i][0]:rang[i][1]+1]=1
+    X_train=X[rang[i][0]:rang[i][1]+1-100]
+    X_test=X
+    y_train=[1.0 for i in range(rang[i][1]-rang[i][0]+1-100)]
+    y_test=yi
+    one_class_svm(X_train,X_test,y_train,y_test,i)
+
+
 X=conv_data.real
+print()
+print()
 
 for i in range(10):
     yi=[-1 for i in range(len(y))]
