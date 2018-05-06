@@ -1,1 +1,0 @@
-# 6th-sem-mini-Project
